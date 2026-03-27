@@ -55,6 +55,10 @@ class LoadConfig:
     """Specifies the loading strategy for safetensors weights.
     - "lazy" (default): Weights are memory-mapped from the file. This enables
       on-demand loading and is highly efficient for models on local storage.
+    - "prefetch": Same loading behavior as "lazy", but checkpoint files are
+      first streamed into the OS page cache in the background. This can reduce
+      startup stalls on slower or network-backed storage without changing the
+      runtime tensor path.
     - "eager": The entire file is read into CPU memory upfront before loading.
       This is recommended for models on network filesystems (e.g., Lustre, NFS)
       as it avoids inefficient random reads, significantly speeding up model

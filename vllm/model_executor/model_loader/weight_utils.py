@@ -2,13 +2,16 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Utilities for downloading and initializing model weights."""
 
+import asyncio
 import concurrent.futures
 import fnmatch
 import glob
 import hashlib
 import json
 import os
+import re
 import tempfile
+import threading
 import time
 from collections import defaultdict
 from collections.abc import Callable, Generator
@@ -64,6 +67,14 @@ logger = init_logger(__name__)
 # lock files in the temp directory will be automatically deleted when the
 # system reboots, so users will not complain about annoying lock files
 temp_dir = tempfile.gettempdir()
+
+
+def _natural_sort_key(filepath: str) -> list[object]:
+    """Natural-sort shard filenames so 10 sorts after 9."""
+    return [
+        int(part) if part.isdigit() else part
+        for part in re.split(r"(\d+)", os.path.basename(filepath))
+    ]
 
 
 def enable_hf_transfer():
@@ -671,6 +682,67 @@ def np_cache_weights_iterator(
         yield name, torch.from_numpy(param)
 
 
+def _prefetch_checkpoint(file_path: str) -> None:
+    """Prefetch a checkpoint file into the OS page cache."""
+    block_size = 16 * 1024 * 1024
+    with open(file_path, "rb") as f:
+        while f.read(block_size):
+            pass
+
+
+def _prefetch_all_checkpoints(sorted_files: list[str]) -> None:
+    """Warm checkpoint pages in the background."""
+    if torch.distributed.is_initialized():
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+    else:
+        rank = 0
+        world_size = 1
+
+    paths_to_prefetch = sorted_files[rank::world_size]
+    total_for_rank = len(paths_to_prefetch)
+    num_prefetch_threads = 8
+
+    async def _prefetch_all() -> None:
+        semaphore = asyncio.Semaphore(num_prefetch_threads)
+        completed = 0
+        next_log_pct = 10
+
+        async def prefetch_one(path: str) -> None:
+            nonlocal completed, next_log_pct
+            try:
+                async with semaphore:
+                    await asyncio.to_thread(_prefetch_checkpoint, path)
+                completed += 1
+                if total_for_rank > 0 and next_log_pct <= 100:
+                    pct = 100 * completed / total_for_rank
+                    if pct >= next_log_pct:
+                        logger.info(
+                            "Prefetching checkpoint files: %d%% (%d/%d)",
+                            next_log_pct,
+                            completed,
+                            total_for_rank,
+                        )
+                        next_log_pct += 10
+            except Exception:
+                logger.warning(
+                    "Failed to prefetch checkpoint file %r.", path, exc_info=True
+                )
+
+        await asyncio.gather(*(prefetch_one(path) for path in paths_to_prefetch))
+
+    def _run_prefetch() -> None:
+        start = time.perf_counter()
+        asyncio.run(_prefetch_all())
+        logger.info(
+            "Prefetching checkpoint files into page cache finished in %.2fs",
+            time.perf_counter() - start,
+        )
+
+    logger.info("Prefetching checkpoint files into page cache started")
+    threading.Thread(target=_run_prefetch, daemon=True).start()
+
+
 def safetensors_weights_iterator(
     hf_weights_files: list[str],
     use_tqdm_on_load: bool,
@@ -681,10 +753,14 @@ def safetensors_weights_iterator(
     if safetensors_load_strategy == "eager":
         loading_desc += " (eager)"
 
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+    if safetensors_load_strategy == "prefetch":
+        _prefetch_all_checkpoints(sorted_files)
+
     leftover_state_dict: dict[str, torch.Tensor] = {}
 
     for st_file in tqdm(
-        hf_weights_files,
+        sorted_files,
         desc=loading_desc,
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
@@ -739,11 +815,13 @@ def multi_thread_safetensors_weights_iterator(
         result = load_file(st_file, device="cpu")
         return result
 
+    sorted_files = sorted(hf_weights_files, key=_natural_sort_key)
+
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_load_file, st_file) for st_file in hf_weights_files]
+        futures = (executor.submit(_load_file, st_file) for st_file in sorted_files)
         futures_iter = tqdm(
             concurrent.futures.as_completed(futures),
-            total=len(hf_weights_files),
+            total=len(sorted_files),
             desc="Multi-thread loading shards",
             disable=not enable_tqdm(use_tqdm_on_load),
             bar_format=_BAR_FORMAT,
@@ -751,7 +829,9 @@ def multi_thread_safetensors_weights_iterator(
 
         for future in futures_iter:
             state_dict = future.result()
-            yield from state_dict.items()
+            del future
+            for key in list(state_dict):
+                yield key, state_dict.pop(key)
 
 
 def runai_safetensors_weights_iterator(
@@ -814,13 +894,14 @@ def fastsafetensors_weights_iterator(
     else:
         pg = SingleGroup()
 
-    device = torch.device(f"cuda:{pg.rank()}")
+    device = torch.device(f"cuda:{current_platform.current_device()}")
+    hf_weights_files = sorted(hf_weights_files, key=_natural_sort_key)
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())
     ]
 
-    nogds = False
+    nogds = pg.size() > 1
 
     for f_list in tqdm(
         weight_files_sub_lists,
