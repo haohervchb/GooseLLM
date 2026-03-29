@@ -8,6 +8,9 @@ Decode uses a paged Flash V100 kernel that reads vLLM's KV cache directly.
 
 from __future__ import annotations
 
+from pathlib import Path
+import sys
+
 import torch
 
 from vllm.logger import init_logger
@@ -33,18 +36,55 @@ _logged_prefill_flash = False
 _logged_decode_flash = False
 
 
+def _ensure_flash_attn_v100_on_path() -> bool:
+    candidate_roots = [
+        Path("/home/rah/flash-attention-v100"),
+        Path(__file__).resolve().parents[4] / "flash-attention-v100",
+    ]
+    for root in candidate_roots:
+        if not (root / "flash_attn_v100" / "__init__.py").exists():
+            continue
+        root_str = str(root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        return True
+    return False
+
+
 def _get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
     global _flash_attn_func, _flash_attn_decode_paged
     if _flash_attn_func is None or _flash_attn_decode_paged is None:
         try:
-            from flash_attn_v100 import flash_attn_decode_paged, flash_attn_func
+            import flash_attn_v100 as flash_attn_v100_mod
 
-            _flash_attn_func = flash_attn_func
-            _flash_attn_decode_paged = flash_attn_decode_paged
+            _flash_attn_func = getattr(flash_attn_v100_mod, "flash_attn_func", None)
+            _flash_attn_decode_paged = getattr(
+                flash_attn_v100_mod,
+                "flash_attn_decode_paged",
+                None,
+            )
         except ImportError:
-            _flash_attn_func = None
-            _flash_attn_decode_paged = None
+            if _ensure_flash_attn_v100_on_path():
+                try:
+                    import flash_attn_v100 as flash_attn_v100_mod
+
+                    _flash_attn_func = getattr(
+                        flash_attn_v100_mod,
+                        "flash_attn_func",
+                        None,
+                    )
+                    _flash_attn_decode_paged = getattr(
+                        flash_attn_v100_mod,
+                        "flash_attn_decode_paged",
+                        None,
+                    )
+                except ImportError:
+                    _flash_attn_func = None
+                    _flash_attn_decode_paged = None
+            else:
+                _flash_attn_func = None
+                _flash_attn_decode_paged = None
     return _flash_attn_func, _flash_attn_decode_paged
 
 
