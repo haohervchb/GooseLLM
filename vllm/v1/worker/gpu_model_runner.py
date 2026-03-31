@@ -556,6 +556,41 @@ class GPUModelRunner(
         # Cache the device properties.
         self._init_device_properties()
 
+        # Pre-allocated buffers for scatter index operations (avoids per-step
+        # torch.tensor + H2D copies in _scatter_accepted_tokens)
+        self._scatter_sampled_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+        self._scatter_prev_common_req_indices = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int64
+        )
+        self._scatter_draft_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+        self._scatter_prev_draft_token_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+
+        # Pre-allocated buffers for spec decode metadata CPU->GPU copies
+        # (avoids 5 per-step torch.from_numpy(...).to(device) calls)
+        if self.speculative_config:
+            max_spec_tokens = self.max_num_tokens
+            self._spec_cu_num_draft_tokens = self._make_buffer(
+                max_spec_tokens, dtype=torch.int32
+            )
+            self._spec_cu_num_sampled_tokens = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
+            self._spec_logits_indices = self._make_buffer(
+                max_spec_tokens, dtype=torch.int64
+            )
+            self._spec_target_logits_indices = self._make_buffer(
+                max_spec_tokens, dtype=torch.int64
+            )
+            self._spec_bonus_logits_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int64
+            )
+
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
@@ -1396,18 +1431,19 @@ class GPUModelRunner(
             if self.enable_prompt_embeds:
                 self.is_token_ids.gpu[:num_commmon_tokens] = True
             return
-        # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        # Use pre-allocated buffers for scatter indices to avoid per-step
+        # torch.tensor allocation + H2D copy.
+        self._scatter_sampled_indices.copy_from_list(
+            sample_flattened_indices, num_commmon_tokens
+        )
+        self._scatter_prev_common_req_indices.copy_from_list(
+            prev_common_req_indices, num_commmon_tokens
+        )
         self.input_ids.gpu.scatter_(
             dim=0,
-            index=sampled_tokens_index_tensor,
+            index=self._scatter_sampled_indices.gpu[:num_commmon_tokens],
             src=self.input_batch.prev_sampled_token_ids[
-                prev_common_req_indices_tensor, 0
+                self._scatter_prev_common_req_indices.gpu[:num_commmon_tokens], 0
             ],
         )
 
@@ -1416,12 +1452,13 @@ class GPUModelRunner(
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        num_draft = len(spec_flattened_indices)
+        self._scatter_draft_indices.copy_from_list(
+            spec_flattened_indices, num_draft
+        )
+        self._scatter_prev_draft_token_indices.copy_from_list(
+            prev_draft_token_indices, num_draft
+        )
 
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
@@ -1429,8 +1466,10 @@ class GPUModelRunner(
 
         self.input_ids.gpu.scatter_(
             dim=0,
-            index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            index=self._scatter_draft_indices.gpu[:num_draft],
+            src=draft_token_ids.flatten()[
+                self._scatter_prev_draft_token_indices.gpu[:num_draft]
+            ],
         )
 
     def _get_encoder_seq_lens(
@@ -2219,36 +2258,67 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
+        # Use pre-allocated buffers for CPU -> GPU copy to avoid per-step
+        # torch.from_numpy(...).to(device) allocations.
+        num_draft_total = len(cu_num_draft_tokens)
+        num_sampled_total = len(cu_num_sampled_tokens)
+        num_logits = len(logits_indices)
+        num_target_logits = len(target_logits_indices)
+        num_bonus_logits = len(bonus_logits_indices)
+
+        self._spec_cu_num_draft_tokens.cpu[:num_draft_total].copy_(
+            torch.from_numpy(cu_num_draft_tokens)
         )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
+        self._spec_cu_num_draft_tokens.gpu[:num_draft_total].copy_(
+            self._spec_cu_num_draft_tokens.cpu[:num_draft_total], non_blocking=True
         )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
+        cu_num_draft_tokens_gpu = self._spec_cu_num_draft_tokens.gpu[:num_draft_total]
+
+        self._spec_cu_num_sampled_tokens.cpu[:num_sampled_total].copy_(
+            torch.from_numpy(cu_num_sampled_tokens)
         )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
+        self._spec_cu_num_sampled_tokens.gpu[:num_sampled_total].copy_(
+            self._spec_cu_num_sampled_tokens.cpu[:num_sampled_total], non_blocking=True
         )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
+        cu_num_sampled_tokens_gpu = self._spec_cu_num_sampled_tokens.gpu[:num_sampled_total]
+
+        self._spec_logits_indices.cpu[:num_logits].copy_(
+            torch.from_numpy(logits_indices)
         )
+        self._spec_logits_indices.gpu[:num_logits].copy_(
+            self._spec_logits_indices.cpu[:num_logits], non_blocking=True
+        )
+        logits_indices_gpu = self._spec_logits_indices.gpu[:num_logits]
+
+        self._spec_target_logits_indices.cpu[:num_target_logits].copy_(
+            torch.from_numpy(target_logits_indices)
+        )
+        self._spec_target_logits_indices.gpu[:num_target_logits].copy_(
+            self._spec_target_logits_indices.cpu[:num_target_logits], non_blocking=True
+        )
+        target_logits_indices_gpu = self._spec_target_logits_indices.gpu[:num_target_logits]
+
+        self._spec_bonus_logits_indices.cpu[:num_bonus_logits].copy_(
+            torch.from_numpy(bonus_logits_indices)
+        )
+        self._spec_bonus_logits_indices.gpu[:num_bonus_logits].copy_(
+            self._spec_bonus_logits_indices.cpu[:num_bonus_logits], non_blocking=True
+        )
+        bonus_logits_indices_gpu = self._spec_bonus_logits_indices.gpu[:num_bonus_logits]
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_ids = self.input_ids.gpu[logits_indices_gpu]
+        draft_token_ids = draft_token_ids[target_logits_indices_gpu + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            cu_num_sampled_tokens=cu_num_sampled_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
+            cu_num_draft_tokens=cu_num_draft_tokens_gpu,
+            cu_num_sampled_tokens=cu_num_sampled_tokens_gpu,
+            target_logits_indices=target_logits_indices_gpu,
+            bonus_logits_indices=bonus_logits_indices_gpu,
+            logits_indices=logits_indices_gpu,
         )
 
     def _prepare_kv_sharing_fast_prefill(

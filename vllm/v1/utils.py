@@ -132,6 +132,12 @@ class CpuGpuBuffer:
             return self.gpu.copy_(self.cpu, non_blocking=True)
         return self.gpu[:n].copy_(self.cpu[:n], non_blocking=True)
 
+    def copy_from_list(self, data: list, n: int) -> None:
+        """Efficiently copy a Python list into the CPU buffer and stage for GPU copy."""
+        self.cpu[:n].copy_(
+            torch.tensor(data, dtype=self.cpu.dtype, device="cpu", pin_memory=self.cpu.is_pinned())
+        )
+
     def copy_to_cpu(self, n: int | None = None) -> torch.Tensor:
         """NOTE: Because this method is non-blocking, explicit synchronization
         is needed to ensure the data is copied to CPU."""
