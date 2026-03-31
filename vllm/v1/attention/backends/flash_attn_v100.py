@@ -3,7 +3,7 @@
 """Flash Attention V100 backend for SM70.
 
 Prefill uses the dense Flash V100 kernel for strict no-prefix cases.
-Decode uses a paged Flash V100 kernel that reads vLLM's KV cache directly.
+Decode falls back to Triton attention (ai-bond does not provide paged decode).
 """
 
 from __future__ import annotations
@@ -27,14 +27,11 @@ logger = init_logger(__name__)
 
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
-_flash_attn_decode_paged = None
-_paged_kv_utils = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_missing_flash_ops = False
 _logged_prefill_flash = False
-_logged_decode_flash = False
 
 
 def _iter_flash_attn_v100_roots():
@@ -90,109 +87,18 @@ def _import_flash_attn_v100_module():
 
 def _get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
-    global _flash_attn_func, _flash_attn_decode_paged
+    global _flash_attn_func
     flash_attn_v100_mod = _import_flash_attn_v100_module()
     if flash_attn_v100_mod is not None:
         if _flash_attn_func is None:
             _flash_attn_func = getattr(flash_attn_v100_mod, "flash_attn_func", None)
-        if _flash_attn_decode_paged is None:
-            _flash_attn_decode_paged = getattr(
-                flash_attn_v100_mod,
-                "flash_attn_decode_paged",
-                None,
-            )
-    return _flash_attn_func, _flash_attn_decode_paged
-
-
-def _get_paged_kv_utils():
-    """Lazy-load paged KV extraction CUDA extension."""
-    global _paged_kv_utils
-    if _paged_kv_utils is None:
-        try:
-            import paged_kv_utils
-
-            _paged_kv_utils = paged_kv_utils
-        except ImportError:
-            _paged_kv_utils = None
-    return _paged_kv_utils
+    return _flash_attn_func
 
 
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     """Return True if any sequence has KV context before current query tokens."""
     query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
     return not torch.equal(query_lens, attn_metadata.seq_lens)
-
-
-def _extract_contiguous_kv_from_paged_cache(
-    kv_cache: torch.Tensor,
-    block_table: torch.Tensor,
-    seq_lens: torch.Tensor,
-    num_kv_heads: int,
-    head_dim: int,
-    block_size: int,
-    total_tokens: int | None = None,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Extract contiguous K/V from paged KV cache.
-
-    Uses the CUDA extension when available and falls back to a Python path.
-    """
-
-    paged_kv_utils = _get_paged_kv_utils()
-
-    if isinstance(kv_cache, (list, tuple)):
-        key_cache, value_cache = kv_cache[0], kv_cache[1]
-    else:
-        if kv_cache.shape[0] == 2:
-            key_cache, value_cache = kv_cache.unbind(0)
-        elif kv_cache.shape[1] == 2:
-            key_cache, value_cache = kv_cache.unbind(1)
-        else:
-            raise ValueError(
-                f"Unexpected KV cache shape {tuple(kv_cache.shape)}; "
-                "expected dimension 2 at axis 0 or 1"
-            )
-
-    if paged_kv_utils is not None:
-        k_cont = paged_kv_utils.paged_to_contiguous(key_cache, block_table, seq_lens)
-        v_cont = paged_kv_utils.paged_to_contiguous(value_cache, block_table, seq_lens)
-        if total_tokens is None:
-            total_tokens = int(seq_lens.sum().item())
-        return k_cont[:total_tokens], v_cont[:total_tokens]
-
-    # Slow Python fallback.
-    batch_size = block_table.shape[0]
-    if total_tokens is None:
-        total_tokens = int(seq_lens.sum().item())
-
-    k_cont = torch.empty(
-        (total_tokens, num_kv_heads, head_dim),
-        dtype=key_cache.dtype,
-        device=key_cache.device,
-    )
-    v_cont = torch.empty(
-        (total_tokens, num_kv_heads, head_dim),
-        dtype=value_cache.dtype,
-        device=value_cache.device,
-    )
-
-    token_offset = 0
-    for batch_idx in range(batch_size):
-        seq_len = int(seq_lens[batch_idx].item())
-        if seq_len == 0:
-            continue
-
-        num_blocks = (seq_len + block_size - 1) // block_size
-        for block_idx in range(num_blocks):
-            physical_block_idx = int(block_table[batch_idx, block_idx].item())
-            start_token = block_idx * block_size
-            end_token = min(start_token + block_size, seq_len)
-            n = end_token - start_token
-
-            k_cont[token_offset:token_offset + n] = key_cache[physical_block_idx, :n]
-            v_cont[token_offset:token_offset + n] = value_cache[physical_block_idx, :n]
-            token_offset += n
-
-    return k_cont, v_cont
 
 
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
@@ -212,131 +118,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.flash_attn_func, self.flash_attn_decode_paged = _get_flash_ops()
+        self.flash_attn_func = _get_flash_ops()
         self.use_flash_v100 = self.flash_attn_func is not None
-        self.use_flash_v100_decode = self.flash_attn_decode_paged is not None
-        self._decode_cache_k: torch.Tensor | None = None
-        self._decode_cache_v: torch.Tensor | None = None
-        self._decode_cache_len = 0
-        self._decode_cache_capacity = 0
-
-    def _reset_decode_cache(self) -> None:
-        self._decode_cache_k = None
-        self._decode_cache_v = None
-        self._decode_cache_len = 0
-        self._decode_cache_capacity = 0
-
-    def _ensure_decode_cache_capacity(
-        self,
-        required_len: int,
-        num_kv_heads: int,
-        head_dim: int,
-        dtype: torch.dtype,
-        device: torch.device,
-    ) -> None:
-        if (
-            self._decode_cache_k is not None
-            and self._decode_cache_v is not None
-            and self._decode_cache_capacity >= required_len
-            and self._decode_cache_k.shape[1] == num_kv_heads
-            and self._decode_cache_k.shape[2] == head_dim
-            and self._decode_cache_k.dtype == dtype
-            and self._decode_cache_k.device == device
-        ):
-            return
-
-        new_capacity = max(required_len, max(16, self._decode_cache_capacity * 2))
-        new_k = torch.empty(
-            (new_capacity, num_kv_heads, head_dim),
-            dtype=dtype,
-            device=device,
-        )
-        new_v = torch.empty(
-            (new_capacity, num_kv_heads, head_dim),
-            dtype=dtype,
-            device=device,
-        )
-
-        if (
-            self._decode_cache_k is not None
-            and self._decode_cache_v is not None
-            and self._decode_cache_len > 0
-        ):
-            new_k[:self._decode_cache_len].copy_(
-                self._decode_cache_k[:self._decode_cache_len]
-            )
-            new_v[:self._decode_cache_len].copy_(
-                self._decode_cache_v[:self._decode_cache_len]
-            )
-
-        self._decode_cache_k = new_k
-        self._decode_cache_v = new_v
-        self._decode_cache_capacity = new_capacity
-
-    def _get_decode_kv_single_seq(
-        self,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,
-        seq_lens_cpu: torch.Tensor,
-        block_size: int,
-        head_dim: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        seq_len = int(seq_lens_cpu[0])
-        q_len = int(attn_metadata.num_actual_tokens)
-        num_kv_heads = key.shape[1]
-
-        cache_hit = (
-            self._decode_cache_k is not None
-            and self._decode_cache_v is not None
-            and seq_len > self._decode_cache_len
-            and seq_len - q_len == self._decode_cache_len
-        )
-
-        if not cache_hit:
-            k_cont, v_cont = _extract_contiguous_kv_from_paged_cache(
-                kv_cache=kv_cache,
-                block_table=attn_metadata.block_table,
-                seq_lens=attn_metadata.seq_lens,
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                block_size=block_size,
-                total_tokens=seq_len,
-            )
-            self._ensure_decode_cache_capacity(
-                seq_len,
-                num_kv_heads,
-                head_dim,
-                k_cont.dtype,
-                k_cont.device,
-            )
-            assert self._decode_cache_k is not None
-            assert self._decode_cache_v is not None
-            self._decode_cache_k[:seq_len].copy_(k_cont)
-            self._decode_cache_v[:seq_len].copy_(v_cont)
-            self._decode_cache_len = seq_len
-            return (
-                self._decode_cache_k[:seq_len],
-                self._decode_cache_v[:seq_len],
-            )
-
-        self._ensure_decode_cache_capacity(
-            seq_len,
-            num_kv_heads,
-            head_dim,
-            key.dtype,
-            key.device,
-        )
-        assert self._decode_cache_k is not None
-        assert self._decode_cache_v is not None
-        self._decode_cache_k[self._decode_cache_len:seq_len].copy_(key[:q_len])
-        self._decode_cache_v[self._decode_cache_len:seq_len].copy_(value[:q_len])
-        self._decode_cache_len = seq_len
-        return (
-            self._decode_cache_k[:seq_len],
-            self._decode_cache_v[:seq_len],
-        )
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
@@ -365,11 +148,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         """Forward path.
 
         - Prefill: use dense Flash V100 only when there is no prefix context.
-        - Decode: use paged Flash V100 when available, otherwise fall back.
+        - Decode: always falls back to Triton (ai-bond has no paged decode kernel).
         """
-        global _logged_decode_flash, _logged_prefill_flash
-        global _warned_decode_fallback, _warned_prefill_fallback
-        global _warned_feature_fallback, _warned_missing_flash_ops
+        global _warned_prefill_fallback, _warned_feature_fallback
+        global _warned_decode_fallback, _warned_missing_flash_ops
+        global _logged_prefill_flash
 
         if attn_metadata is None:
             assert output is not None
@@ -465,40 +248,23 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "FLASH_ATTN_V100 prefill path active (no prefix/chunked context)."
                 )
                 _logged_prefill_flash = True
-            self._reset_decode_cache()
             return self._flash_v100_prefill(query, key, value, attn_metadata, output)
 
-        if not self.use_flash_v100_decode:
-            if self.use_flash_v100 and not _warned_decode_fallback:
-                logger.warning(
-                    "FLASH_ATTN_V100 decode fallback to Triton: paged decode op "
-                    "is unavailable."
-                )
-                _warned_decode_fallback = True
-            return super().forward(
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-                output_scale,
-                output_block_scale,
-            )
-
-        if not _logged_decode_flash:
+        if not _warned_decode_fallback:
             logger.info(
-                "FLASH_ATTN_V100 decode path active (paged KV kernel, CUDA-graph safe)."
+                "FLASH_ATTN_V100 decode path: using Triton (ai-bond has no paged decode kernel)."
             )
-            _logged_decode_flash = True
-        return self._flash_v100_decode(
+            _warned_decode_fallback = True
+        return super().forward(
+            layer,
             query,
             key,
             value,
             kv_cache,
             attn_metadata,
             output,
+            output_scale,
+            output_block_scale,
         )
 
     def _flash_v100_prefill(
@@ -511,7 +277,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> torch.Tensor:
         """Prefill path for no-prefix case (query_len == seq_len per sequence).
 
-        Supports GQA/MQA by expanding K/V heads to match Q heads.
+        Batches all sequences into a single kernel call using (B, M, H, D) format.
+        The ai-bond kernel handles GQA/MQA internally — no repeat_interleave needed.
         """
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -521,76 +288,64 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         num_heads_q = query.shape[1]
         num_heads_kv = key.shape[1]
-        needs_expansion = num_heads_q != num_heads_kv
-        if needs_expansion and num_heads_q % num_heads_kv != 0:
-            raise ValueError(
-                "FLASH_ATTN_V100 prefill requires query heads to be divisible "
-                f"by KV heads, got q={num_heads_q}, kv={num_heads_kv}."
-            )
+        head_dim = query.shape[2]
 
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
         query_start_loc = (
             query_start_loc_cpu if query_start_loc_cpu is not None else attn_metadata.query_start_loc
         )
-        num_seqs = len(query_start_loc) - 1
+
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        seq_lens_tensor = (
+            seq_lens_cpu if seq_lens_cpu is not None else attn_metadata.seq_lens
+        )
+        seq_lens = [int(seq_lens_tensor[i].item()) for i in range(len(seq_lens_tensor))]
+
+        num_seqs = len(seq_lens)
+        max_seq_len = max(seq_lens)
+
+        q_padded = torch.zeros(
+            (num_seqs, max_seq_len, num_heads_q, head_dim),
+            dtype=query.dtype,
+            device=query.device,
+        )
+        k_padded = torch.zeros(
+            (num_seqs, max_seq_len, num_heads_kv, head_dim),
+            dtype=key.dtype,
+            device=key.device,
+        )
+        v_padded = torch.zeros(
+            (num_seqs, max_seq_len, num_heads_kv, head_dim),
+            dtype=value.dtype,
+            device=value.device,
+        )
 
         for i in range(num_seqs):
             start = int(query_start_loc[i].item())
             end = int(query_start_loc[i + 1].item())
             if end <= start:
                 continue
+            length = end - start
+            q_padded[i, :length] = query[start:end]
+            k_padded[i, :length] = key[start:end]
+            v_padded[i, :length] = value[start:end]
 
-            q_seq = query[start:end].unsqueeze(0)
-            k_seq = key[start:end].unsqueeze(0)
-            v_seq = value[start:end].unsqueeze(0)
-
-            if needs_expansion:
-                repeat_factor = num_heads_q // num_heads_kv
-                k_seq = k_seq.repeat_interleave(repeat_factor, dim=2)
-                v_seq = v_seq.repeat_interleave(repeat_factor, dim=2)
-
-            out_seq = self.flash_attn_func(
-                q_seq,
-                k_seq,
-                v_seq,
-                causal=True,
-                softmax_scale=self.scale,
-            )
-            out_view[start:end].copy_(out_seq.squeeze(0))
-
-        return output
-
-    def _flash_v100_decode(
-        self,
-        query: torch.Tensor,
-        key: torch.Tensor,
-        value: torch.Tensor,
-        kv_cache: torch.Tensor,
-        attn_metadata: TritonAttentionMetadata,
-        output: torch.Tensor,
-    ) -> torch.Tensor:
-        """Decode path using Flash V100 directly over paged KV cache."""
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        query = query[:num_actual_tokens]
-        out_view = output[:num_actual_tokens]
-
-        if query.shape[0] == 0:
-            return output
-
-        if kv_cache.shape[0] == 2:
-            key_cache, value_cache = kv_cache.unbind(0)
-        else:
-            key_cache, value_cache = kv_cache.unbind(1)
-
-        self.flash_attn_decode_paged(
-            query,
-            key_cache,
-            value_cache,
-            attn_metadata.block_table,
-            attn_metadata.seq_lens,
+        out_padded = self.flash_attn_func(
+            q_padded,
+            k_padded,
+            v_padded,
+            causal=True,
             softmax_scale=self.scale,
-            out=out_view,
         )
+
+        for i in range(num_seqs):
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            if end <= start:
+                continue
+            length = end - start
+            out_view[start:end] = out_padded[i, :length]
+
         return output
 
 

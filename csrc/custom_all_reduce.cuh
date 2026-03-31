@@ -81,7 +81,11 @@ struct packed_t {
   // the (P)acked type for load/store
   using P = array_t<T, 16 / sizeof(T)>;
   // the (A)ccumulator type for reduction
-  using A = array_t<float, 16 / sizeof(T)>;
+  // For half-precision types, use half as accumulator to reduce register
+  // pressure and NVLink bandwidth. For float, keep float.
+  using A = std::conditional_t<std::is_same<T, float>::value,
+                               array_t<float, 16 / sizeof(T)>,
+                               array_t<T, 16 / sizeof(T)>>;
 };
 
 #define DINLINE __device__ __forceinline__
@@ -127,31 +131,13 @@ DINLINE array_t<T, N>& packed_assign_add(array_t<T, N>& a, array_t<T, N> b) {
 }
 
 template <typename T, int N>
-DINLINE array_t<float, N> upcast(array_t<T, N> val) {
-  if constexpr (std::is_same<T, float>::value) {
-    return val;
-  } else {
-    array_t<float, N> out;
-#pragma unroll
-    for (int i = 0; i < N; i++) {
-      out.data[i] = upcast_s(val.data[i]);
-    }
-    return out;
-  }
+DINLINE array_t<T, N> upcast(array_t<T, N> val) {
+  return val;
 }
 
 template <typename O>
-DINLINE O downcast(array_t<float, O::size> val) {
-  if constexpr (std::is_same<typename O::type, float>::value) {
-    return val;
-  } else {
-    O out;
-#pragma unroll
-    for (int i = 0; i < O::size; i++) {
-      out.data[i] = downcast_s<typename O::type>(val.data[i]);
-    }
-    return out;
-  }
+DINLINE O downcast(array_t<typename O::type, O::size> val) {
+  return val;
 }
 
 #if !defined(USE_ROCM)
