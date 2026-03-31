@@ -35,3 +35,8 @@ docker run --rm \
   --enable-auto-tool-choice \
   --tool-call-parser qwen3_coder
 ```
+
+## References
+
+- 1Cat-vLLM: https://github.com/1CatAI/1Cat-vLLM
+- ai-bond flash-attention-v100: https://github.com/ai-bond/flash-attention-v100
