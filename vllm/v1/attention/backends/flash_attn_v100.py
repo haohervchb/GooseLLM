@@ -368,6 +368,21 @@ class FlashAttnV100Backend(TritonAttentionBackend):
         return "FLASH_ATTN_V100"
 
     @staticmethod
+    def get_kv_cache_stride_order(
+        include_num_layers_dimension: bool = False,
+    ) -> tuple[int, ...]:
+        # Use HND physical layout for V100 decode. The semantic shape stays
+        # [num_blocks, 2, block_size, num_kv_heads, head_size], but the raw
+        # allocation is [num_blocks, 2, num_kv_heads, block_size, head_size],
+        # which gives decode a better access pattern while preserving the
+        # existing cache update and prefill interfaces.
+        logger.info_once(
+            "FLASH_ATTN_V100 using HND physical KV cache layout for decode.")
+        if include_num_layers_dimension:
+            return (1, 0, 2, 4, 3, 5)
+        return (0, 1, 3, 2, 4)
+
+    @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # Flash Attention V100 requires head_dim % 8 == 0.
         return [64, 80, 96, 112, 128, 256]
