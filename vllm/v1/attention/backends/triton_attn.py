@@ -42,20 +42,14 @@ def _use_sm70_decode_kernel() -> bool:
     """Check if SM70 decode kernel should be used.
 
     The SM70 decode kernel uses SIMT FMA operations optimized for V100
-    (which lacks FP16 tensor cores). It is enabled via environment variable
-    VLLM_USE_SM70_DECODE=1 and only applies to SM70 GPUs during decode.
+    (which lacks FP16 tensor cores). It is enabled by default on SM70 GPUs
+    during decode when conditions are met. Can be disabled with
+    VLLM_USE_SM70_DECODE=0.
     """
     if not _is_sm70():
         return False
-    if os.getenv("VLLM_USE_SM70_DECODE", "0") != "1":
-        return False
-    if os.getenv("VLLM_USE_SM70_DECODE_FORCE", "0") != "1":
-        logger.warning_once(
-            "Ignoring VLLM_USE_SM70_DECODE=1 on this branch because the "
-            "current SM70 standalone decode kernel is experimental and can be "
-            "much slower than Triton. Set VLLM_USE_SM70_DECODE_FORCE=1 to "
-            "force-enable it."
-        )
+    env_val = os.getenv("VLLM_USE_SM70_DECODE", "1")
+    if env_val == "0":
         return False
     return True
 
@@ -602,6 +596,7 @@ class TritonAttentionImpl(AttentionImpl):
             and self.sliding_window == (-1, -1)
             and self.sinks is None
             and key_cache.shape[3] in (64, 128, 256)
+            and block_table.shape[1] <= 256
         ):
             from vllm.v1.attention.ops.sm70_decode import (
                 ensure_sm70_paged_decode_available,

@@ -98,16 +98,17 @@ __global__ void sm70_paged_decode_kernel_fp16(
     const int tokens_in_block = min(static_cast<int>(block_size), seq_len - token_start);
     const int tile_elems = BLOCK_SIZE * HEAD_SIZE;
 
+    const int64_t k_base = physical_block_idx * k_stride_0 + kv_head_idx * k_stride_2;
+    const int64_t v_base = physical_block_idx * v_stride_0 + kv_head_idx * v_stride_2;
+
     for (int idx = threadIdx.x; idx < tile_elems; idx += NUM_THREADS) {
       const int token_in_block = idx / HEAD_SIZE;
       const int dim = idx % HEAD_SIZE;
       if (token_in_block < tokens_in_block) {
-        k_tile[idx] = *(key_cache + physical_block_idx * k_stride_0
-                        + token_in_block * k_stride_1 + kv_head_idx * k_stride_2
-                        + dim * k_stride_3);
-        v_tile[idx] = *(value_cache + physical_block_idx * v_stride_0
-                        + token_in_block * v_stride_1 + kv_head_idx * v_stride_2
-                        + dim * v_stride_3);
+        const int64_t k_off = k_base + token_in_block * k_stride_1 + dim * k_stride_3;
+        const int64_t v_off = v_base + token_in_block * v_stride_1 + dim * v_stride_3;
+        k_tile[idx] = __ldcs(&key_cache[k_off]);
+        v_tile[idx] = __ldcs(&value_cache[v_off]);
       } else {
         k_tile[idx] = __float2half(0.0f);
         v_tile[idx] = __float2half(0.0f);
