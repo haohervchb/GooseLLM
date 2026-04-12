@@ -38,6 +38,28 @@ from vllm.v1.kv_cache_interface import AttentionSpec
 logger = init_logger(__name__)
 
 
+def _use_sm70_decode_kernel() -> bool:
+    """Check if SM70 decode kernel should be used.
+
+    The SM70 decode kernel uses SIMT FMA operations optimized for V100
+    (which lacks FP16 tensor cores). It is enabled via environment variable
+    VLLM_USE_SM70_DECODE=1 and only applies to SM70 GPUs during decode.
+    """
+    if not _is_sm70():
+        return False
+    if os.getenv("VLLM_USE_SM70_DECODE", "0") != "1":
+        return False
+    if os.getenv("VLLM_USE_SM70_DECODE_FORCE", "0") != "1":
+        logger.warning_once(
+            "Ignoring VLLM_USE_SM70_DECODE=1 on this branch because the "
+            "current SM70 standalone decode kernel is experimental and can be "
+            "much slower than Triton. Set VLLM_USE_SM70_DECODE_FORCE=1 to "
+            "force-enable it."
+        )
+        return False
+    return True
+
+
 # constants
 MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
 NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
@@ -568,6 +590,51 @@ class TritonAttentionImpl(AttentionImpl):
 
         descale_shape = (cu_seqlens_q.shape[0] - 1, key_cache.shape[2])
         mm_prefix_range_tensor = attn_metadata.mm_prefix_range_tensor
+
+        # Use SM70-optimized decode kernel when enabled and conditions are met
+        if (
+            _use_sm70_decode_kernel()
+            and max_seqlen_q == 1
+            and self.attn_type == AttentionType.DECODER
+            and not self.kv_cache_dtype.startswith("fp8")
+            and self.alibi_slopes is None
+            and self.logits_soft_cap == 0
+            and self.sliding_window == (-1, -1)
+            and self.sinks is None
+            and key_cache.shape[3] in (64, 128, 256)
+        ):
+            from vllm.v1.attention.ops.sm70_decode import (
+                ensure_sm70_paged_decode_available,
+                get_sm70_decode_impl_label,
+                sm70_paged_decode_attention,
+            )
+
+            try:
+                ensure_sm70_paged_decode_available()
+                logger.info_once(
+                    "SM70 decode path active via %s extension.",
+                    get_sm70_decode_impl_label(),
+                )
+
+                sm70_paged_decode_attention(
+                    output=output[:num_actual_tokens],
+                    query=query[:num_actual_tokens],
+                    key_cache=key_cache,
+                    value_cache=value_cache,
+                    num_kv_heads=self.num_kv_heads,
+                    scale=self.scale,
+                    block_tables=block_table,
+                    seq_lens=seqused_k,
+                    block_size=key_cache.shape[1],
+                    max_seq_len=max_seqlen_k,
+                )
+                return output
+            except Exception as exc:
+                logger.warning_once(
+                    "SM70 decode kernel fallback to Triton due to runtime "
+                    "failure: %s",
+                    exc,
+                )
 
         unified_attention(
             q=query[:num_actual_tokens],

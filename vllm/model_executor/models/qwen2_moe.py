@@ -73,7 +73,7 @@ from .utils import (
 logger = init_logger(__name__)
 SM70_SHARED_GATE_MAX_M = int(os.getenv("VLLM_SM70_SHARED_GATE_MAX_M", "64"))
 SM70_GATE_UP_GATED_SILU = (
-    os.getenv("VLLM_SM70_GATE_UP_GATED_SILU", "0") == "1"
+    os.getenv("VLLM_SM70_GATE_UP_GATED_SILU", "1") == "1"
 )
 
 

@@ -213,6 +213,32 @@ AGENTS.md
 # Sphinx documentation
 _build/
 
+# Root CMake/Ninja build outputs
+/.ninja_deps
+/.ninja_log
+/CMakeCache.txt
+/CMakeFiles/
+/CPackConfig.cmake
+/CPackSourceConfig.cmake
+/_deps/
+/build.ninja
+/cmake_install.cmake
+/ctest/
+/detect_cuda_compute_capabilities.cu
+/detect_cuda_version.cc
+
+# Local packaged build outputs
+/dist-cu128-sm70/
+/third_party/
+/vllm-flash-attn/
+
+# Local source backup snapshot
+/vllm_src_backup/**
+!/vllm_src_backup/v1/
+!/vllm_src_backup/v1/attention/
+!/vllm_src_backup/v1/attention/backends/
+!/vllm_src_backup/v1/attention/backends/flash_attn_v100.py
+
 # vim swap files
 *.swo
 *.swp

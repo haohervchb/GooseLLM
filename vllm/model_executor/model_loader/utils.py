@@ -23,6 +23,7 @@ from vllm.model_executor.model_loader.reload import (
     set_torchao_reload_attrs,
 )
 from vllm.model_executor.models.interfaces import SupportsQuant
+from vllm.utils.torch_utils import get_cuda_view_from_cpu_tensor
 from vllm.utils.platform_utils import is_pin_memory_available
 
 logger = init_logger(__name__)
@@ -109,7 +110,8 @@ def process_weights_after_loading(
         ):
             # TODO(lucas): see if there is a way to unify the signatures
             # of process_weights_after_loading
-            module.process_weights_after_loading(model_config.dtype)
+            with device_loading_context(module, target_device):
+                module.process_weights_after_loading(model_config.dtype)
 
     # Needed for torchao model reloading via model.reload_weights
     # @kylesayrs @jerryzh168 this can be removed if callers move to `reload_weights`
@@ -125,12 +127,15 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
         return
 
     original_device_states: dict[str, torch.device] = {}
+    uva_offloaded_parameters: list[str] = []
 
     # Store original device states and move parameters to GPU if they're on CPU
     for name, p in module.named_parameters():
         if p.device.type == "cpu":
             original_device_states[name] = p.device
             p.data = p.data.to(target_device)
+        if getattr(p, "_vllm_is_uva_offloaded", False):
+            uva_offloaded_parameters.append(name)
         # Parameters already on target device are not touched
 
     try:
@@ -156,6 +161,15 @@ def device_loading_context(module: torch.nn.Module, target_device: torch.device)
                     p.data = cpu_data
                 else:
                     p.data = p.data.to(original_device)
+            if name in uva_offloaded_parameters and not getattr(
+                p, "_vllm_is_uva_offloaded", False
+            ):
+                cpu_data = p.data.to(device="cpu")
+                if pin_memory:
+                    cpu_data = cpu_data.pin_memory()
+                p._vllm_offloaded_cpu_data = cpu_data
+                p.data = get_cuda_view_from_cpu_tensor(cpu_data)
+                p._vllm_is_uva_offloaded = True
         # New parameters or parameters already on target device are untouched
 
 

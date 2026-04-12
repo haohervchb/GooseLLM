@@ -75,9 +75,15 @@ def reshape_and_cache_kernel_flash(
             + (cur_dim % x)
         )
     else:
-        tgt_base = block_idx * block_stride + block_offset * page_stride
-        tgt_idx_k = tgt_base + tile_pos
-        tgt_idx_v = tgt_base + tile_pos
+        cur_head = tile_pos // head_size
+        cur_dim = tile_pos % head_size
+        tgt_base = (
+            block_idx * block_stride
+            + block_offset * page_stride
+            + cur_head * head_stride
+        )
+        tgt_idx_k = tgt_base + cur_dim * dim_stride_k
+        tgt_idx_v = tgt_base + cur_dim * dim_stride_v
 
     # [TILE_SIZE]
     key_load = tl.load(
@@ -142,8 +148,8 @@ def triton_reshape_and_cache_flash(
     else:
         block_size = key_cache.shape[1]
         x = 1
-        dim_stride_k = 0
-        dim_stride_v = 0
+        dim_stride_k = key_cache.stride(3)
+        dim_stride_v = value_cache.stride(3)
         head_stride = key_cache.stride()[2]
     n = num_heads * head_size
     key_stride = key.stride()[0]

@@ -1,0 +1,99 @@
+FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONUNBUFFERED=1 \
+    HF_HOME=/root/.cache/huggingface \
+    VLLM_NO_USAGE_STATS=1 \
+    VLLM_ATTENTION_BACKEND=FLASH_ATTN_V100 \
+    CUDA_HOME=/usr/local/cuda-12.8 \
+    PATH=/usr/local/cuda-12.8/bin:$PATH \
+    LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH \
+    VLLM_TARGET_DEVICE=cuda \
+    VLLM_MAIN_CUDA_VERSION=12.8 \
+    FLASH_ATTN_V100_DIR=/opt/flash-attention-v100-ai-bond \
+    TORCH_CUDA_ARCH_LIST=7.0 \
+    MAX_JOBS=20 \
+    NVCC_THREADS=1
+
+ARG FLASH_ATTN_V100_REPO=https://github.com/ai-bond/flash-attention-v100.git
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        bash \
+        build-essential \
+        ca-certificates \
+        curl \
+        git \
+        wget \
+        libgl1 \
+        libglib2.0-0 \
+        libgomp1 \
+        libssl-dev \
+        zlib1g-dev \
+        tini \
+        python3.12 \
+        python3.12-dev \
+        python3-pip \
+        python3.12-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
+
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3 && python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
+
+RUN if [ -d /usr/local/cuda-12.8 ]; then ln -sf /usr/local/cuda-12.8 /usr/local/cuda; fi
+
+COPY requirements /tmp/requirements
+
+RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
+
+RUN pip3 install -r /tmp/requirements/cuda.txt --break-system-packages
+
+RUN pip3 install cmake build setuptools_scm grpcio-tools --break-system-packages
+
+WORKDIR /build
+
+COPY . /build/
+
+RUN rm -rf \
+        .deps \
+        _deps \
+        build \
+        build.ninja \
+        CMakeCache.txt \
+        CMakeFiles \
+        cmake_install.cmake \
+        CPackConfig.cmake \
+        CPackSourceConfig.cmake \
+        ctest \
+        detect_cuda_compute_capabilities.cu \
+        detect_cuda_version.cc \
+        dist-cu128-sm70 \
+        third_party \
+        vllm.egg-info \
+        .ninja_deps \
+        .ninja_log
+
+RUN git clone --depth 1 "${FLASH_ATTN_V100_REPO}" "${FLASH_ATTN_V100_DIR}" \
+    && cd "${FLASH_ATTN_V100_DIR}" \
+    && sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_available():/' setup.py \
+    && MAX_JOBS=4 CUDA_HOME=/usr/local/cuda CMAKE_CUDA_ARCHITECTURES=70 TORCH_CUDA_ARCH_LIST="7.0" \
+    pip3 install . --no-build-isolation --break-system-packages
+
+RUN cd /build \
+    && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 python3 -m build --wheel --no-isolation --outdir dist-cu128-sm70 \
+    && pip3 install dist-cu128-sm70/*.whl --no-deps --break-system-packages
+
+WORKDIR /workspace
+EXPOSE 8000
+
+COPY docker/entrypoint.sm70.sh /usr/local/bin/entrypoint.sm70.sh
+RUN chmod +x /usr/local/bin/entrypoint.sm70.sh
+
+ENTRYPOINT ["tini", "--", "/usr/local/bin/entrypoint.sm70.sh"]
+CMD []

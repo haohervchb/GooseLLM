@@ -556,6 +556,41 @@ class GPUModelRunner(
         # Cache the device properties.
         self._init_device_properties()
 
+        # Pre-allocated buffers for scatter index operations (avoids per-step
+        # torch.tensor + H2D copies in _scatter_accepted_tokens)
+        self._scatter_sampled_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+        self._scatter_prev_common_req_indices = self._make_buffer(
+            self.max_num_reqs, dtype=torch.int64
+        )
+        self._scatter_draft_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+        self._scatter_prev_draft_token_indices = self._make_buffer(
+            self.max_num_tokens, dtype=torch.int64
+        )
+
+        # Pre-allocated buffers for spec decode metadata CPU->GPU copies
+        # (avoids 5 per-step torch.from_numpy(...).to(device) calls)
+        if self.speculative_config:
+            max_spec_tokens = self.max_num_tokens
+            self._spec_cu_num_draft_tokens = self._make_buffer(
+                max_spec_tokens, dtype=torch.int32
+            )
+            self._spec_cu_num_sampled_tokens = self._make_buffer(
+                self.max_num_reqs + 1, dtype=torch.int32
+            )
+            self._spec_logits_indices = self._make_buffer(
+                max_spec_tokens, dtype=torch.int64
+            )
+            self._spec_target_logits_indices = self._make_buffer(
+                max_spec_tokens, dtype=torch.int64
+            )
+            self._spec_bonus_logits_indices = self._make_buffer(
+                self.max_num_reqs, dtype=torch.int64
+            )
+
         # Encoder timing registry for observability
         self.encoder_timing_registry: dict[str, EncoderTimingStats] = {}
         self._encoder_timing_lock = threading.Lock()
@@ -684,8 +719,10 @@ class GPUModelRunner(
         self.draft_token_ids_copy_stream: torch.cuda.Stream | None = None
         self.valid_sampled_token_count_cpu: torch.Tensor | None = None
         self.draft_token_ids_cpu: torch.Tensor | None = None
+        self.num_accepted_tokens_event: torch.Event | None = None
         if self.num_spec_tokens:
             self.draft_token_ids_event = torch.Event()
+            self.num_accepted_tokens_event = torch.Event()
             self.draft_token_ids_copy_stream = torch.cuda.Stream()
             self.draft_token_ids_cpu = torch.empty(
                 (self.max_num_reqs, self.num_spec_tokens),
@@ -870,6 +907,27 @@ class GPUModelRunner(
     def _sync_device(self) -> None:
         torch.cuda.synchronize()
 
+    def _zero_block_ids(self, block_ids: list[int]) -> None:
+        if not block_ids:
+            return
+        unique_block_ids = torch.tensor(
+            sorted(set(block_ids)), dtype=torch.long, device=self.device
+        )
+        max_block_id = int(unique_block_ids[-1].item())
+
+        def _zero_cache_entry(cache_entry: object) -> None:
+            if isinstance(cache_entry, torch.Tensor):
+                if cache_entry.ndim == 0 or cache_entry.shape[0] <= max_block_id:
+                    return
+                cache_entry.index_fill_(0, unique_block_ids, 0)
+                return
+            if isinstance(cache_entry, list):
+                for nested_entry in cache_entry:
+                    _zero_cache_entry(nested_entry)
+
+        for cache_entry in self.kv_caches:
+            _zero_cache_entry(cache_entry)
+
     def _update_states(self, scheduler_output: "SchedulerOutput") -> None:
         """Update the cached states and the persistent batch with the scheduler
         output.
@@ -892,6 +950,9 @@ class GPUModelRunner(
         # and handling the second as a new request.
         for req_id in scheduler_output.finished_req_ids:
             self.input_batch.remove_request(req_id)
+
+        if scheduler_output.new_block_ids_to_zero:
+            self._zero_block_ids(scheduler_output.new_block_ids_to_zero)
 
         # Free the cached encoder outputs.
         for mm_hash in scheduler_output.free_encoder_mm_hashes:
@@ -1132,7 +1193,8 @@ class GPUModelRunner(
             return
 
         # Find the number of accepted tokens for each sequence.
-        num_accepted_tokens = (
+        num_reqs = output_token_ids.size(0)
+        self.num_accepted_tokens.gpu[:num_reqs] = (
             (
                 torch.cat(
                     [
@@ -1149,12 +1211,10 @@ class GPUModelRunner(
             )
             .int()
             .argmax(-1)
-            .cpu()
-            .numpy()
         )
-        for i, num_tokens in enumerate(num_accepted_tokens):
-            self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
         if self.cache_config.mamba_cache_mode == "align":
+            for i, num_tokens in enumerate(self.num_accepted_tokens.gpu[:num_reqs].cpu().numpy()):
+                self.input_batch.num_accepted_tokens_cpu[i] = num_tokens
             mamba_utils.postprocess_mamba(
                 scheduler_output,
                 self.kv_cache_config,
@@ -1164,6 +1224,12 @@ class GPUModelRunner(
                 self.compilation_config.static_forward_context,
                 self.model.get_mamba_state_copy_func(),
             )
+        else:
+            self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+                self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
+            )
+            assert self.num_accepted_tokens_event is not None
+            self.num_accepted_tokens_event.record()
 
     def _update_streaming_request(
         self, req_id: str, new_req_data: NewRequestData
@@ -1365,18 +1431,19 @@ class GPUModelRunner(
             if self.enable_prompt_embeds:
                 self.is_token_ids.gpu[:num_commmon_tokens] = True
             return
-        # Upload the index tensors asynchronously so the scatter can be non-blocking.
-        sampled_tokens_index_tensor = torch.tensor(
-            sample_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_common_req_indices_tensor = torch.tensor(
-            prev_common_req_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        # Use pre-allocated buffers for scatter indices to avoid per-step
+        # torch.tensor allocation + H2D copy.
+        self._scatter_sampled_indices.copy_from_list(
+            sample_flattened_indices, num_commmon_tokens
+        )
+        self._scatter_prev_common_req_indices.copy_from_list(
+            prev_common_req_indices, num_commmon_tokens
+        )
         self.input_ids.gpu.scatter_(
             dim=0,
-            index=sampled_tokens_index_tensor,
+            index=self._scatter_sampled_indices.gpu[:num_commmon_tokens],
             src=self.input_batch.prev_sampled_token_ids[
-                prev_common_req_indices_tensor, 0
+                self._scatter_prev_common_req_indices.gpu[:num_commmon_tokens], 0
             ],
         )
 
@@ -1385,12 +1452,13 @@ class GPUModelRunner(
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
-        prev_draft_token_indices_tensor = torch.tensor(
-            prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
+        num_draft = len(spec_flattened_indices)
+        self._scatter_draft_indices.copy_from_list(
+            spec_flattened_indices, num_draft
+        )
+        self._scatter_prev_draft_token_indices.copy_from_list(
+            prev_draft_token_indices, num_draft
+        )
 
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
@@ -1398,8 +1466,10 @@ class GPUModelRunner(
 
         self.input_ids.gpu.scatter_(
             dim=0,
-            index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            index=self._scatter_draft_indices.gpu[:num_draft],
+            src=draft_token_ids.flatten()[
+                self._scatter_prev_draft_token_indices.gpu[:num_draft]
+            ],
         )
 
     def _get_encoder_seq_lens(
@@ -1705,6 +1775,8 @@ class GPUModelRunner(
             max_seq_len = self.seq_lens.np[:num_reqs].max().item()
 
         if use_spec_decode:
+            if self.num_accepted_tokens_event is not None:
+                self.num_accepted_tokens_event.synchronize()
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
@@ -2186,36 +2258,67 @@ class GPUModelRunner(
         # [0, 1, 2, 5, 6, 9]
         target_logits_indices += arange
 
-        # TODO: Optimize the CPU -> GPU copy.
-        cu_num_draft_tokens = torch.from_numpy(cu_num_draft_tokens).to(
-            self.device, non_blocking=True
+        # Use pre-allocated buffers for CPU -> GPU copy to avoid per-step
+        # torch.from_numpy(...).to(device) allocations.
+        num_draft_total = len(cu_num_draft_tokens)
+        num_sampled_total = len(cu_num_sampled_tokens)
+        num_logits = len(logits_indices)
+        num_target_logits = len(target_logits_indices)
+        num_bonus_logits = len(bonus_logits_indices)
+
+        self._spec_cu_num_draft_tokens.cpu[:num_draft_total].copy_(
+            torch.from_numpy(cu_num_draft_tokens)
         )
-        cu_num_sampled_tokens = torch.from_numpy(cu_num_sampled_tokens).to(
-            self.device, non_blocking=True
+        self._spec_cu_num_draft_tokens.gpu[:num_draft_total].copy_(
+            self._spec_cu_num_draft_tokens.cpu[:num_draft_total], non_blocking=True
         )
-        logits_indices = torch.from_numpy(logits_indices).to(
-            self.device, non_blocking=True
+        cu_num_draft_tokens_gpu = self._spec_cu_num_draft_tokens.gpu[:num_draft_total]
+
+        self._spec_cu_num_sampled_tokens.cpu[:num_sampled_total].copy_(
+            torch.from_numpy(cu_num_sampled_tokens)
         )
-        target_logits_indices = torch.from_numpy(target_logits_indices).to(
-            self.device, non_blocking=True
+        self._spec_cu_num_sampled_tokens.gpu[:num_sampled_total].copy_(
+            self._spec_cu_num_sampled_tokens.cpu[:num_sampled_total], non_blocking=True
         )
-        bonus_logits_indices = torch.from_numpy(bonus_logits_indices).to(
-            self.device, non_blocking=True
+        cu_num_sampled_tokens_gpu = self._spec_cu_num_sampled_tokens.gpu[:num_sampled_total]
+
+        self._spec_logits_indices.cpu[:num_logits].copy_(
+            torch.from_numpy(logits_indices)
         )
+        self._spec_logits_indices.gpu[:num_logits].copy_(
+            self._spec_logits_indices.cpu[:num_logits], non_blocking=True
+        )
+        logits_indices_gpu = self._spec_logits_indices.gpu[:num_logits]
+
+        self._spec_target_logits_indices.cpu[:num_target_logits].copy_(
+            torch.from_numpy(target_logits_indices)
+        )
+        self._spec_target_logits_indices.gpu[:num_target_logits].copy_(
+            self._spec_target_logits_indices.cpu[:num_target_logits], non_blocking=True
+        )
+        target_logits_indices_gpu = self._spec_target_logits_indices.gpu[:num_target_logits]
+
+        self._spec_bonus_logits_indices.cpu[:num_bonus_logits].copy_(
+            torch.from_numpy(bonus_logits_indices)
+        )
+        self._spec_bonus_logits_indices.gpu[:num_bonus_logits].copy_(
+            self._spec_bonus_logits_indices.cpu[:num_bonus_logits], non_blocking=True
+        )
+        bonus_logits_indices_gpu = self._spec_bonus_logits_indices.gpu[:num_bonus_logits]
 
         # Compute the draft token ids.
         # draft_token_indices:      [  1,   2,   3, 105, 106, 208]
-        draft_token_ids = self.input_ids.gpu[logits_indices]
-        draft_token_ids = draft_token_ids[target_logits_indices + 1]
+        draft_token_ids = self.input_ids.gpu[logits_indices_gpu]
+        draft_token_ids = draft_token_ids[target_logits_indices_gpu + 1]
 
         return SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
-            cu_num_draft_tokens=cu_num_draft_tokens,
-            cu_num_sampled_tokens=cu_num_sampled_tokens,
-            target_logits_indices=target_logits_indices,
-            bonus_logits_indices=bonus_logits_indices,
-            logits_indices=logits_indices,
+            cu_num_draft_tokens=cu_num_draft_tokens_gpu,
+            cu_num_sampled_tokens=cu_num_sampled_tokens_gpu,
+            target_logits_indices=target_logits_indices_gpu,
+            bonus_logits_indices=bonus_logits_indices_gpu,
+            logits_indices=logits_indices_gpu,
         )
 
     def _prepare_kv_sharing_fast_prefill(
