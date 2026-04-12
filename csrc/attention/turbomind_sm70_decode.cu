@@ -40,14 +40,14 @@ __global__ void sm70_paged_decode_kernel_fp16(
     int64_t v_stride_1,
     int64_t v_stride_2,
     int64_t v_stride_3) {
-  static_assert(BLOCK_SIZE == 16 || BLOCK_SIZE == 32,
-                "Supported block sizes are 16 and 32");
+  static_assert(BLOCK_SIZE == 16 || BLOCK_SIZE == 32 || BLOCK_SIZE == 64 || BLOCK_SIZE == 128,
+                "Supported block sizes are 16, 32, 64, and 128");
   static_assert(CTA_H >= 1 && CTA_H <= 4, "CTA_H must be in [1, 4]");
 
   constexpr int WARP = 32;
   constexpr int NUM_THREADS = CTA_H * WARP;
   constexpr int ROWS_PER_THREAD = (HEAD_SIZE + WARP - 1) / WARP;
-  constexpr int THREAD_GROUP_SIZE = BLOCK_SIZE >= WARP ? 1 : (WARP / BLOCK_SIZE);
+  constexpr int THREAD_GROUP_SIZE = BLOCK_SIZE <= 32 ? (WARP / BLOCK_SIZE) : 1;
 
   const int seq_idx = blockIdx.y;
   const int cta_idx = blockIdx.x;
@@ -347,6 +347,44 @@ void sm70_paged_decode_attention(
           return;
         case 256:
           launch_sm70_paged_decode_fp16<256, 32>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+      }
+      break;
+    case 64:
+      switch (head_size) {
+        case 64:
+          launch_sm70_paged_decode_fp16<64, 64>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 128:
+          launch_sm70_paged_decode_fp16<128, 64>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 256:
+          launch_sm70_paged_decode_fp16<256, 64>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+      }
+      break;
+    case 128:
+      switch (head_size) {
+        case 64:
+          launch_sm70_paged_decode_fp16<64, 128>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 128:
+          launch_sm70_paged_decode_fp16<128, 128>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 256:
+          launch_sm70_paged_decode_fp16<256, 128>(
               out, query, key_cache, value_cache, num_kv_heads, scale,
               block_tables, seq_lens, block_size);
           return;
