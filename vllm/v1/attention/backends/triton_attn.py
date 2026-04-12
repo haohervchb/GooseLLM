@@ -596,7 +596,7 @@ class TritonAttentionImpl(AttentionImpl):
             and self.sliding_window == (-1, -1)
             and self.sinks is None
             and key_cache.shape[3] in (64, 128, 256)
-            and block_table.shape[1] <= 256
+            and key_cache.shape[1] in (16, 32)
         ):
             from vllm.v1.attention.ops.sm70_decode import (
                 ensure_sm70_paged_decode_available,
