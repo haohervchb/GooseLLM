@@ -48,6 +48,7 @@ from vllm.forward_context import (
     set_forward_context,
 )
 from vllm.logger import init_logger
+from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.lora.layers import LoRAMapping, LoRAMappingType
 from vllm.model_executor.layers.attention import Attention, MLAAttention
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -374,6 +375,21 @@ class GPUModelRunner(
         self.dcp_world_size = self.parallel_config.decode_context_parallel_size
         self.dcp_rank = 0 if self.dcp_world_size <= 1 else get_dcp_group().rank_in_group
         self.max_num_tokens = scheduler_config.max_num_batched_tokens
+        # FA2 V100 paged kernel handles prefix/chunked per-sequence efficiently.
+        # Increase max tokens per chunk to reduce prefill overhead for long prompts.
+        if (
+            self.vllm_config is not None
+            and self.vllm_config.attention_config.backend
+            == AttentionBackendEnum.FLASH_ATTN_V100
+        ):
+            if self.max_num_tokens < 65536:
+                self.max_num_tokens = 65536
+                logger.info(
+                    "FLASH_ATTN_V100: increased max_num_tokens to %d "
+                    "(was %d) for fewer prefill chunks.",
+                    self.max_num_tokens,
+                    scheduler_config.max_num_batched_tokens,
+                )
         self.max_num_reqs = scheduler_config.max_num_seqs
 
         # Broadcast PP output for external_launcher (torchrun)

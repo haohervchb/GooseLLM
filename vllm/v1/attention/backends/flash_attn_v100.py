@@ -4,6 +4,12 @@
 
 Prefill uses the Flash V100 paged kernel (block-table KV cache).
 Decode uses SM70 decode kernel or Triton attention.
+
+When this backend is active, the model runner automatically increases
+max_num_tokens from the scheduler default (typically 8192-16384) to 65536,
+reducing the number of chunks for long prompts without sacrificing
+decode throughput or VRAM. The FA2 paged kernel handles prefix/chunked
+prefill efficiently per-sequence.
 """
 
 from __future__ import annotations
