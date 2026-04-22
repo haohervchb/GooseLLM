@@ -151,6 +151,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self._flash_attn_paged_ready = True
         return True
 
+    def _supports_flash_v100_path(self) -> bool:
+        """Check whether current layer/config can run Flash V100 safely."""
+        return (
+            self.use_flash_v100
+            and self.attn_type == AttentionType.DECODER
+            and self.alibi_slopes is None
+            and self.logits_soft_cap == 0
+            and self.sinks is None
+            and self.sliding_window == (-1, -1)
+            and not self.kv_cache_dtype.startswith("fp8")
+        )
+
     def forward(
         self,
         layer: torch.nn.Module,
