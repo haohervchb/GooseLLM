@@ -329,10 +329,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if attn_metadata.prefix_kv_lens is not None:
             prefix_kv_lens = attn_metadata.prefix_kv_lens
         else:
-            # All zeros — pure prefill (no prefix context)
-            prefix_kv_lens = torch.zeros(
-                seq_lens.size(0), dtype=seq_lens.dtype, device=seq_lens.device
-            )
+            # Compute prefix KV lengths for chunked prefill:
+            # prefix = seq_len - query_len
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            prefix_kv_lens = seq_lens - query_lens
+            prefix_kv_lens = torch.clamp(prefix_kv_lens, min=0)
 
         block_size = k_cache.shape[1]
         softmax_scale = self.scale
