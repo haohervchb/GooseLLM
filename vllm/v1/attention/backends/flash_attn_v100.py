@@ -306,9 +306,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # Extract K/V from paged KV cache: [num_blocks, 2, block_size, num_kv_heads, head_size]
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Ensure contiguous layout (paged kernel expects standard strides)
-        k_cache = key_cache.contiguous()
-        v_cache = value_cache.contiguous()
+        # Only copy if non-contiguous (vLLM cache is usually already contiguous)
+        k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
+        v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
         # Expand K/V for GQA/MQA: repeat heads to match Q
         if num_heads_q != num_heads_kv:
@@ -316,8 +316,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             k_cache = k_cache.repeat_interleave(repeat_factor, dim=2)
             v_cache = v_cache.repeat_interleave(repeat_factor, dim=2)
             num_heads_kv = num_heads_q
-
-        out = torch.empty_like(query)
 
         # Get metadata
         query_start_loc = attn_metadata.query_start_loc
@@ -338,8 +336,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         block_size = k_cache.shape[1]
         softmax_scale = self.scale
 
-        # Call paged kernel: returns (out, softmax_lse)
-        out, softmax_lse = self.flash_attn_paged(
+        # Call paged kernel: writes directly into out_view to avoid intermediate copy
+        _unused_out, softmax_lse = self.flash_attn_paged(
             query,
             k_cache,
             v_cache,
@@ -347,14 +345,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             seq_lens,
             query_start_loc,
             prefix_kv_lens,
-            out=out,
+            out=out_view,
             block_size=block_size,
             softmax_scale=softmax_scale,
             causal=True,
         )
-
-        # Copy output to the shared output view
-        out_view.copy_(out)
 
         return output
 
