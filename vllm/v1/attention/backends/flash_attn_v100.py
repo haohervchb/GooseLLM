@@ -306,9 +306,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # Extract K/V from paged KV cache: [num_blocks, 2, block_size, num_kv_heads, head_size]
         key_cache, value_cache = kv_cache.unbind(1)
 
-        # Only copy if non-contiguous (vLLM cache is usually already contiguous)
-        k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
-        v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
+        # Pass the unbind(1) views directly to the kernel.
+        # The paged kernel uses explicit strides (kv_block_stride / kv_head_stride /
+        # kv_token_stride) so it can handle the non-contiguous view from unbind(1)
+        # without an intermediate copy.  This is a head-major layout:
+        #   [num_blocks, num_kv_heads, block_size, head_size]
+        k_cache = key_cache
+        v_cache = value_cache
 
         # Get metadata
         query_start_loc = attn_metadata.query_start_loc
@@ -326,7 +330,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             prefix_kv_lens = seq_lens - query_lens
             prefix_kv_lens = torch.clamp(prefix_kv_lens, min=0)
 
-        block_size = k_cache.shape[1]
+        block_size = k_cache.shape[2]
         softmax_scale = self.scale
 
         # Call paged kernel with native GQA support.
