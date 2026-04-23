@@ -310,13 +310,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
         v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
-        # Expand K/V for GQA/MQA: repeat heads to match Q
-        if num_heads_q != num_heads_kv:
-            repeat_factor = num_heads_q // num_heads_kv
-            k_cache = k_cache.repeat_interleave(repeat_factor, dim=2)
-            v_cache = v_cache.repeat_interleave(repeat_factor, dim=2)
-            num_heads_kv = num_heads_q
-
         # Get metadata
         query_start_loc = attn_metadata.query_start_loc
         seq_lens = attn_metadata.seq_lens
@@ -336,7 +329,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         block_size = k_cache.shape[1]
         softmax_scale = self.scale
 
-        # Call paged kernel: writes directly into out_view to avoid intermediate copy
+        # Call paged kernel with native GQA support.
+        # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
         _unused_out, softmax_lse = self.flash_attn_paged(
             query,
             k_cache,
@@ -349,6 +343,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             block_size=block_size,
             softmax_scale=softmax_scale,
             causal=True,
+            num_kv_heads=num_heads_kv,
         )
 
         return output
