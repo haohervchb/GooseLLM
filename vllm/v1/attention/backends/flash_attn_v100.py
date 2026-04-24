@@ -2,8 +2,14 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Flash Attention V100 backend for SM70.
 
-Prefill uses the dense Flash V100 kernel for strict no-prefix cases.
-Decode falls back to Triton attention (ai-bond does not provide paged decode).
+Prefill uses the Flash V100 paged kernel (block-table KV cache).
+Decode uses SM70 decode kernel or Triton attention.
+
+When this backend is active, the model runner automatically increases
+max_num_tokens from the scheduler default (typically 8192-16384) to 65536,
+reducing the number of chunks for long prompts without sacrificing
+decode throughput or VRAM. The FA2 paged kernel handles prefix/chunked
+prefill efficiently per-sequence.
 """
 
 from __future__ import annotations
@@ -27,6 +33,7 @@ logger = init_logger(__name__)
 
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
+_flash_attn_paged = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
@@ -87,22 +94,20 @@ def _import_flash_attn_v100_module():
 
 def _get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
-    global _flash_attn_func
+    global _flash_attn_func, _flash_attn_paged
     flash_attn_v100_mod = _import_flash_attn_v100_module()
     if flash_attn_v100_mod is not None:
         if _flash_attn_func is None:
             _flash_attn_func = getattr(flash_attn_v100_mod, "flash_attn_func", None)
-    return _flash_attn_func
-
-
-def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
-    """Return True if any sequence has KV context before current query tokens."""
-    query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
-    return not torch.equal(query_lens, attn_metadata.seq_lens)
+        if _flash_attn_paged is None:
+            _flash_attn_paged = getattr(
+                flash_attn_v100_mod, "flash_attn_paged_forward", None
+            )
+    return _flash_attn_func, _flash_attn_paged
 
 
 class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
-    """Attach CPU metadata for the dense prefill path."""
+    """Attach CPU metadata for the paged prefill path."""
 
     _cudagraph_support = AttentionCGSupport.UNIFORM_SINGLE_TOKEN_DECODE
 
@@ -114,12 +119,37 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
 
 class FlashAttnV100Impl(TritonAttentionImpl):
-    """Flash Attention V100 implementation with strict fallback policy."""
+    """Flash Attention V100 implementation with paged prefill support."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.flash_attn_func = _get_flash_ops()
+        self.flash_attn_func, self.flash_attn_paged = _get_flash_ops()
         self.use_flash_v100 = self.flash_attn_func is not None
+        self.use_flash_paged = self.flash_attn_paged is not None
+        self._flash_attn_paged_ready = False
+
+    def _ensure_paged_ready(self):
+        """Validate paged kernel is ready (head dim, device, etc.)."""
+        if self._flash_attn_paged_ready:
+            return True
+        if not self.use_flash_paged:
+            return False
+        if self.attn_type != AttentionType.DECODER:
+            return False
+        if self.alibi_slopes is not None:
+            return False
+        if self.logits_soft_cap != 0:
+            return False
+        if self.sinks is not None:
+            return False
+        if self.sliding_window != (-1, -1):
+            return False
+        if self.kv_cache_dtype.startswith("fp8"):
+            return False
+        # NOTE: the paged kernel grid is (q_tiles, seqs, num_heads); each block
+        # handles one head independently, so any positive num_heads works.
+        self._flash_attn_paged_ready = True
+        return True
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
@@ -147,8 +177,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> torch.Tensor:
         """Forward path.
 
-        - Prefill: use dense Flash V100 only when there is no prefix context.
-        - Decode: always falls back to Triton (ai-bond has no paged decode kernel).
+        - Prefill: use Flash V100 paged kernel (handles prefix/chunked).
+        - Decode: uses SM70 decode kernel (via Triton super).
         """
         global _warned_prefill_fallback, _warned_feature_fallback
         global _warned_decode_fallback, _warned_missing_flash_ops
@@ -207,29 +237,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     output_scale,
                     output_block_scale,
                 )
-            if key.shape[1] == 0 or query.shape[1] % key.shape[1] != 0:
-                if not _warned_prefill_fallback:
+            if not self._ensure_paged_ready():
+                if self.use_flash_paged and not _warned_prefill_fallback:
                     logger.warning(
-                        "FLASH_ATTN_V100 prefill fallback: unsupported Q/KV head "
-                        "layout for grouped attention. Using Triton for correctness."
-                    )
-                    _warned_prefill_fallback = True
-                return super().forward(
-                    layer,
-                    query,
-                    key,
-                    value,
-                    kv_cache,
-                    attn_metadata,
-                    output,
-                    output_scale,
-                    output_block_scale,
-                )
-            if _has_prefix_context(attn_metadata):
-                if not _warned_prefill_fallback:
-                    logger.warning(
-                        "FLASH_ATTN_V100 prefill fallback: detected prefix/chunked "
-                        "prefill (seq_len > query_len). Using Triton for correctness."
+                        "FLASH_ATTN_V100 prefill fallback: paged kernel not ready "
+                        "(head dim, device, or feature mismatch). Using Triton."
                     )
                     _warned_prefill_fallback = True
                 return super().forward(
@@ -245,14 +257,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 )
             if not _logged_prefill_flash:
                 logger.info(
-                    "FLASH_ATTN_V100 prefill path active (no prefix/chunked context)."
+                    "FLASH_ATTN_V100 paged prefill path active (handles prefix/chunked)."
                 )
                 _logged_prefill_flash = True
-            return self._flash_v100_prefill(query, key, value, attn_metadata, output)
+            return self._flash_v100_paged_prefill(
+                query, key, value, kv_cache, attn_metadata, output
+            )
 
         if not _warned_decode_fallback:
             logger.info(
-                "FLASH_ATTN_V100 decode path: using Triton (ai-bond has no paged decode kernel)."
+                "FLASH_ATTN_V100 decode path: using SM70/Triton kernels."
             )
             _warned_decode_fallback = True
         return super().forward(
@@ -267,84 +281,70 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             output_block_scale,
         )
 
-    def _flash_v100_prefill(
+    def _flash_v100_paged_prefill(
         self,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
+        kv_cache: torch.Tensor,
         attn_metadata: TritonAttentionMetadata,
         output: torch.Tensor,
     ) -> torch.Tensor:
-        """Prefill path for no-prefix case (query_len == seq_len per sequence).
+        """Prefill path using FA2 paged kernel with block-table KV cache lookup.
 
-        Batches all sequences into a single kernel call using (B, M, H, D) format.
-        The ai-bond kernel handles GQA/MQA internally — no repeat_interleave needed.
+        Handles both pure prefill (query_len == seq_len) and chunked/prefix
+        prefill (query_len < seq_len) via the prefix_kv_lens parameter.
         """
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
-        key = key[:num_actual_tokens]
-        value = value[:num_actual_tokens]
         out_view = output[:num_actual_tokens]
 
         num_heads_q = query.shape[1]
         num_heads_kv = key.shape[1]
         head_dim = query.shape[2]
 
-        query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
-        query_start_loc = (
-            query_start_loc_cpu if query_start_loc_cpu is not None else attn_metadata.query_start_loc
-        )
+        # Extract K/V from paged KV cache: [num_blocks, 2, block_size, num_kv_heads, head_size]
+        key_cache, value_cache = kv_cache.unbind(1)
 
-        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
-        seq_lens_tensor = (
-            seq_lens_cpu if seq_lens_cpu is not None else attn_metadata.seq_lens
-        )
-        seq_lens = [int(seq_lens_tensor[i].item()) for i in range(len(seq_lens_tensor))]
+        # Only copy if non-contiguous (vLLM cache is usually already contiguous)
+        k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
+        v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
-        num_seqs = len(seq_lens)
-        max_seq_len = max(seq_lens)
+        # Get metadata
+        query_start_loc = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
 
-        q_padded = torch.zeros(
-            (num_seqs, max_seq_len, num_heads_q, head_dim),
-            dtype=query.dtype,
-            device=query.device,
-        )
-        k_padded = torch.zeros(
-            (num_seqs, max_seq_len, num_heads_kv, head_dim),
-            dtype=key.dtype,
-            device=key.device,
-        )
-        v_padded = torch.zeros(
-            (num_seqs, max_seq_len, num_heads_kv, head_dim),
-            dtype=value.dtype,
-            device=value.device,
-        )
+        # Prefix lengths — needed for chunked prefill (query starts partway through KV)
+        # For pure prefill, all zeros. For chunked, uses prefix_kv_lens from metadata.
+        if attn_metadata.prefix_kv_lens is not None:
+            prefix_kv_lens = attn_metadata.prefix_kv_lens
+        else:
+            # Compute prefix KV lengths for chunked prefill:
+            # prefix = seq_len - query_len
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            prefix_kv_lens = seq_lens - query_lens
+            prefix_kv_lens = torch.clamp(prefix_kv_lens, min=0)
 
-        for i in range(num_seqs):
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            if end <= start:
-                continue
-            length = end - start
-            q_padded[i, :length] = query[start:end]
-            k_padded[i, :length] = key[start:end]
-            v_padded[i, :length] = value[start:end]
+        block_size = k_cache.shape[1]
+        softmax_scale = self.scale
 
-        out_padded = self.flash_attn_func(
-            q_padded,
-            k_padded,
-            v_padded,
+        # Call paged kernel with native GQA support.
+        # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
+        _unused_out, softmax_lse = self.flash_attn_paged(
+            query,
+            k_cache,
+            v_cache,
+            block_table,
+            seq_lens,
+            query_start_loc,
+            prefix_kv_lens,
+            out=out_view,
+            block_size=block_size,
+            softmax_scale=softmax_scale,
             causal=True,
-            softmax_scale=self.scale,
+            num_kv_heads=num_heads_kv,
         )
-
-        for i in range(num_seqs):
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
-            if end <= start:
-                continue
-            length = end - start
-            out_view[start:end] = out_padded[i, :length]
 
         return output
 
@@ -371,16 +371,15 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        # Use HND physical layout for V100 decode. The semantic shape stays
-        # [num_blocks, 2, block_size, num_kv_heads, head_size], but the raw
-        # allocation is [num_blocks, 2, num_kv_heads, block_size, head_size],
-        # which gives decode a better access pattern while preserving the
-        # existing cache update and prefill interfaces.
-        logger.info_once(
-            "FLASH_ATTN_V100 using HND physical KV cache layout for decode.")
+        # DISABLED: HND (head-major) layout caused 20% decode slowdown and
+        # serious decay with prompt length. Triton decode loads tokens within
+        # a block contiguously; HND scatters them by num_kv_heads. The paged
+        # prefill kernel also had to copy non-contiguous KV cache every call.
+        # Reverting to default block-major layout until a custom SM70 decode
+        # kernel is actually deployed and proven faster.
         if include_num_layers_dimension:
-            return (1, 0, 2, 4, 3, 5)
-        return (0, 1, 3, 2, 4)
+            return (1, 0, 2, 3, 4, 5)
+        return (0, 1, 2, 3, 4)
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:

@@ -40,14 +40,14 @@ __global__ void sm70_paged_decode_kernel_fp16(
     int64_t v_stride_1,
     int64_t v_stride_2,
     int64_t v_stride_3) {
-  static_assert(BLOCK_SIZE == 16 || BLOCK_SIZE == 32,
-                "Supported block sizes are 16 and 32");
+  static_assert(BLOCK_SIZE == 16 || BLOCK_SIZE == 32 || BLOCK_SIZE == 64 || BLOCK_SIZE == 128,
+                "Supported block sizes are 16, 32, 64, and 128");
   static_assert(CTA_H >= 1 && CTA_H <= 4, "CTA_H must be in [1, 4]");
 
   constexpr int WARP = 32;
   constexpr int NUM_THREADS = CTA_H * WARP;
   constexpr int ROWS_PER_THREAD = (HEAD_SIZE + WARP - 1) / WARP;
-  constexpr int THREAD_GROUP_SIZE = BLOCK_SIZE >= WARP ? 1 : (WARP / BLOCK_SIZE);
+  constexpr int THREAD_GROUP_SIZE = BLOCK_SIZE <= 32 ? (WARP / BLOCK_SIZE) : 1;
 
   const int seq_idx = blockIdx.y;
   const int cta_idx = blockIdx.x;
@@ -98,16 +98,17 @@ __global__ void sm70_paged_decode_kernel_fp16(
     const int tokens_in_block = min(static_cast<int>(block_size), seq_len - token_start);
     const int tile_elems = BLOCK_SIZE * HEAD_SIZE;
 
+    const int64_t k_base = physical_block_idx * k_stride_0 + kv_head_idx * k_stride_2;
+    const int64_t v_base = physical_block_idx * v_stride_0 + kv_head_idx * v_stride_2;
+
     for (int idx = threadIdx.x; idx < tile_elems; idx += NUM_THREADS) {
       const int token_in_block = idx / HEAD_SIZE;
       const int dim = idx % HEAD_SIZE;
       if (token_in_block < tokens_in_block) {
-        k_tile[idx] = *(key_cache + physical_block_idx * k_stride_0
-                        + token_in_block * k_stride_1 + kv_head_idx * k_stride_2
-                        + dim * k_stride_3);
-        v_tile[idx] = *(value_cache + physical_block_idx * v_stride_0
-                        + token_in_block * v_stride_1 + kv_head_idx * v_stride_2
-                        + dim * v_stride_3);
+        const int64_t k_off = k_base + token_in_block * k_stride_1 + dim * k_stride_3;
+        const int64_t v_off = v_base + token_in_block * v_stride_1 + dim * v_stride_3;
+        k_tile[idx] = __ldcs(&key_cache[k_off]);
+        v_tile[idx] = __ldcs(&value_cache[v_off]);
       } else {
         k_tile[idx] = __float2half(0.0f);
         v_tile[idx] = __float2half(0.0f);
@@ -346,6 +347,44 @@ void sm70_paged_decode_attention(
           return;
         case 256:
           launch_sm70_paged_decode_fp16<256, 32>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+      }
+      break;
+    case 64:
+      switch (head_size) {
+        case 64:
+          launch_sm70_paged_decode_fp16<64, 64>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 128:
+          launch_sm70_paged_decode_fp16<128, 64>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 256:
+          launch_sm70_paged_decode_fp16<256, 64>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+      }
+      break;
+    case 128:
+      switch (head_size) {
+        case 64:
+          launch_sm70_paged_decode_fp16<64, 128>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 128:
+          launch_sm70_paged_decode_fp16<128, 128>(
+              out, query, key_cache, value_cache, num_kv_heads, scale,
+              block_tables, seq_lens, block_size);
+          return;
+        case 256:
+          launch_sm70_paged_decode_fp16<256, 128>(
               out, query, key_cache, value_cache, num_kv_heads, scale,
               block_tables, seq_lens, block_size);
           return;
