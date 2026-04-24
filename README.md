@@ -25,7 +25,7 @@ python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
 python -m pip install -r requirements/cuda.txt
-python -m pip install cmake build
+python -m pip install 'setuptools>=77.0.3,<81.0.0' 'setuptools_scm>=8' grpcio-tools cmake build
 
 # 3. Set build environment
 export CUDA_HOME=/usr/local/cuda-12.8

@@ -51,7 +51,7 @@ RUN pip3 install torch torchvision torchaudio --index-url https://download.pytor
 
 RUN pip3 install -r /tmp/requirements/cuda.txt --break-system-packages
 
-RUN pip3 install cmake build setuptools_scm grpcio-tools --break-system-packages
+RUN pip3 install 'setuptools>=77.0.3,<81.0.0' 'setuptools_scm>=8' grpcio-tools cmake build --break-system-packages
 
 WORKDIR /build
 
