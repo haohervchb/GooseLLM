@@ -371,18 +371,15 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     def get_kv_cache_stride_order(
         include_num_layers_dimension: bool = False,
     ) -> tuple[int, ...]:
-        # Use standard N-bc layout. The FA2 paged kernel requires contiguous
-        # K/V cache tensors. SM70 decode kernel handles the HND layout
-        # internally via stride access patterns.
-        # NOTE: We keep the HND layout for decode compatibility:
-        # stride order swaps block_size and num_kv_heads dims so SM70 decode
-        # gets better access patterns (head-major), while the paged kernel
-        # makes a contiguous copy anyway.
-        logger.info_once(
-            "FLASH_ATTN_V100 using HND physical KV cache layout for decode.")
+        # DISABLED: HND (head-major) layout caused 20% decode slowdown and
+        # serious decay with prompt length. Triton decode loads tokens within
+        # a block contiguously; HND scatters them by num_kv_heads. The paged
+        # prefill kernel also had to copy non-contiguous KV cache every call.
+        # Reverting to default block-major layout until a custom SM70 decode
+        # kernel is actually deployed and proven faster.
         if include_num_layers_dimension:
-            return (1, 0, 2, 4, 3, 5)
-        return (0, 1, 3, 2, 4)
+            return (1, 0, 2, 3, 4, 5)
+        return (0, 1, 2, 3, 4)
 
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
