@@ -125,6 +125,8 @@ def get_cmdclass():
                     max_jobs_mem = max(1, int(free_mem_gb / mem_per_job_gb))
                     max_jobs_cores = max(1, (cores - 2) // nvcc_threads)
 
+                    # Cap at 6 for auto-detect to avoid OOM on unknown machines.
+                    # If MAX_JOBS is explicitly set via env, we respect it above.
                     jobs = max(1, min(max_jobs_mem, max_jobs_cores, 6))
 
                     if free_mem_gb >= 10 and cores >= 8:

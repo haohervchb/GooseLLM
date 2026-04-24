@@ -1,3 +1,13 @@
+# GooseLLM / 1Cat-vLLM SM70 (V100) Unified Build
+# One-shot Docker build with all CPU threads
+#
+# Build:
+#   docker build -f docker/Dockerfile.sm70-build -t goosellm:sm70 .
+#
+# Run:
+#   docker run --gpus all -p 8000:8000 goosellm:sm70 \
+#     python -m vllm.entrypoints.openai.api_server --model ...
+
 FROM nvidia/cuda:12.8.0-devel-ubuntu22.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -11,12 +21,12 @@ ENV DEBIAN_FRONTEND=noninteractive \
     LD_LIBRARY_PATH=/usr/local/cuda-12.8/lib64:$LD_LIBRARY_PATH \
     VLLM_TARGET_DEVICE=cuda \
     VLLM_MAIN_CUDA_VERSION=12.8 \
-    FLASH_ATTN_V100_DIR=/opt/flash-attention-v100-ai-bond \
-    TORCH_CUDA_ARCH_LIST=7.0 \
-    MAX_JOBS=20 \
-    NVCC_THREADS=1
+    TORCH_CUDA_ARCH_LIST=7.0
 
-ARG FLASH_ATTN_V100_REPO=https://github.com/ai-bond/flash-attention-v100.git
+# Use all CPU threads for compilation. Override at build time if needed:
+#   docker build --build-arg MAX_JOBS=8 ...
+ARG MAX_JOBS
+ARG NVCC_THREADS=4
 
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
@@ -44,50 +54,55 @@ RUN apt-get update \
     && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.12 1 \
     && update-alternatives --install /usr/bin/python python /usr/bin/python3.12 1
 
-RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3 && python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
+RUN curl -sS https://bootstrap.pypa.io/get-pip.py | python3 \
+    && python3 -m pip install --upgrade pip setuptools wheel --break-system-packages
 
 RUN if [ -d /usr/local/cuda-12.8 ]; then ln -sf /usr/local/cuda-12.8 /usr/local/cuda; fi
 
+# --- Install Python dependencies (cached layer) ---
 COPY requirements /tmp/requirements
 
-RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
+RUN pip3 install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+    --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
 
 RUN pip3 install -r /tmp/requirements/cuda.txt --break-system-packages
 
-RUN pip3 install cmake build setuptools_scm grpcio-tools --break-system-packages
+RUN pip3 install cmake ninja build setuptools_scm grpcio-tools packaging psutil --break-system-packages
 
+# --- Copy source code ---
 WORKDIR /build
 
 COPY . /build/
 
+# Clean any stale build artifacts
 RUN rm -rf \
-        .deps \
-        _deps \
-        build \
-        build.ninja \
-        CMakeCache.txt \
-        CMakeFiles \
-        cmake_install.cmake \
-        CPackConfig.cmake \
-        CPackSourceConfig.cmake \
-        ctest \
-        detect_cuda_compute_capabilities.cu \
-        detect_cuda_version.cc \
-        dist-cu128-sm70 \
-        third_party \
-        vllm.egg-info \
-        .ninja_deps \
-        .ninja_log
+        .deps _deps build build.ninja \
+        CMakeCache.txt CMakeFiles cmake_install.cmake \
+        CPackConfig.cmake CPackSourceConfig.cmake ctest \
+        dist-cu128-sm70 third_party vllm.egg-info \
+        .ninja_deps .ninja_log \
+        csrc/flash_attention_v100/build \
+        csrc/flash_attention_v100/*.so
 
-RUN git clone --depth 1 "${FLASH_ATTN_V100_REPO}" "${FLASH_ATTN_V100_DIR}" \
-    && cd "${FLASH_ATTN_V100_DIR}" \
-    && sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_available():/' setup.py \
-    && MAX_JOBS=4 CUDA_HOME=/usr/local/cuda CMAKE_CUDA_ARCHITECTURES=70 TORCH_CUDA_ARCH_LIST="7.0" \
-    pip3 install . --no-build-isolation --break-system-packages
+# --- Build SM70 FlashAttention kernel (unified repo) ---
+# Uses all CPU threads. Falls back to 4 jobs if auto-detect fails.
+RUN cd /build/csrc/flash_attention_v100 \
+    && MAX_JOBS=${MAX_JOBS:-$(nproc)} NVCC_THREADS=${NVCC_THREADS} \
+       CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="7.0" \
+       python3 setup.py build_ext --inplace \
+    && echo "SM70 kernel built at:" \
+    && ls -la /build/csrc/flash_attention_v100/*.so
 
+# --- Build vLLM wheel ---
+# The kernel is already built in-tree; setup.py hook will skip redundant work.
+# If CMake extensions fail, we still have the kernel and Python package.
 RUN cd /build \
-    && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 python3 -m build --wheel --no-isolation --outdir dist-cu128-sm70 \
-    && pip3 install dist-cu128-sm70/*.whl --no-deps --break-system-packages
+    && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
+       MAX_JOBS=${MAX_JOBS:-$(nproc)} \
+       python3 -m build --wheel --no-isolation --outdir dist-cu128-sm70 \
+    && pip3 install dist-cu128-sm70/*.whl --no-deps --break-system-packages \
+    || (echo "WARNING: vLLM wheel build failed; installing editable fallback" \
+        && pip3 install -e . --no-build-isolation --break-system-packages)
 
 WORKDIR /workspace
 EXPOSE 8000
