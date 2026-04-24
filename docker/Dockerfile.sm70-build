@@ -65,11 +65,11 @@ RUN cd /build/csrc/flash_attention_v100 \
     && MAX_JOBS=4 CUDA_HOME=/usr/local/cuda CMAKE_CUDA_ARCHITECTURES=70 TORCH_CUDA_ARCH_LIST="7.0" \
        python3 -m pip install . --no-build-isolation --break-system-packages
 
-# Build vLLM wheel (matches 1Cat's original process)
+# Build vLLM wheel using setup.py (avoids PEP 517 build isolation issues)
 RUN cd /build \
     && rm -rf build vllm.egg-info .deps/*-build .deps/*-subbuild \
     && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
-       python3 -m build --wheel --no-isolation --outdir dist-cu128-sm70 \
+       python3 setup.py bdist_wheel --dist-dir dist-cu128-sm70 \
     && python3 -m pip install dist-cu128-sm70/*.whl --no-deps --break-system-packages
 
 WORKDIR /workspace
