@@ -4,43 +4,9 @@ High-throughput LLM inference on Tesla V100 GPUs with custom FlashAttention-2 ke
 
 ## Quick Start
 
-### Local Build (Conda Environment)
+### Docker Build (Recommended)
 
-**Always use a Conda environment.** The build requires PyTorch with CUDA and specific compiler toolchains that are best isolated.
-
-```bash
-# 1. Create and activate environment
-conda create -n goosellm python=3.12 -y
-conda activate goosellm
-
-# 2. Install PyTorch with CUDA 12.8
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
-    --index-url https://download.pytorch.org/whl/cu128
-
-# 3. Install build dependencies (required for --no-build-isolation)
-pip install setuptools_scm cmake ninja build packaging wheel psutil
-
-# 4. Clone and build
-git clone https://github.com/haohervchb/GooseLLM.git
-cd GooseLLM
-
-# Build vLLM + SM70 kernel (uses all CPU threads automatically)
-MAX_JOBS=$(nproc) NVCC_THREADS=4 pip install -e . --no-build-isolation
-```
-
-**If vLLM's CMake build fails** (optional extensions), the kernel is still usable:
-
-```bash
-# Build only the SM70 kernel
-cd csrc/flash_attention_v100
-MAX_JOBS=$(nproc) python setup.py build_ext --inplace
-cd ../..
-
-# Install vLLM Python package without C++ extensions
-pip install -e . --no-build-isolation
-```
-
-### Docker Build
+Docker provides a hermetic build with the full CUDA 12.8 toolkit. This is the most reliable method.
 
 ```bash
 docker build \
@@ -59,6 +25,36 @@ docker build \
   -t goosellm:sm70 \
   .
 ```
+
+### Local Build (Conda Environment)
+
+**Note:** vLLM's upstream CMake build includes kernels for SM80+ (BF16/FP8) that fail to compile on SM70. Use the **two-step build** below.
+
+```bash
+# 1. Create and activate environment
+conda create -n goosellm python=3.12 -y
+conda activate goosellm
+
+# 2. Install PyTorch with CUDA 12.8
+pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 3. Install build dependencies
+pip install setuptools_scm cmake ninja build packaging wheel psutil
+
+# 4. Clone and build kernel
+git clone https://github.com/haohervchb/GooseLLM.git
+cd GooseLLM
+
+cd csrc/flash_attention_v100
+MAX_JOBS=$(nproc) NVCC_THREADS=4 python setup.py build_ext --inplace
+cd ../..
+
+# 5. Install vLLM Python package (no C++ extensions needed for SM70)
+pip install -e . --no-build-isolation
+```
+
+**Why two steps?** The SM70 kernel is built separately. vLLM's Python backend (`flash_attn_v100.py`) discovers it automatically. You do not need vLLM's `_C` / `_moe_C` extensions — they contain SM80+ only code.
 
 ### Run Server
 
