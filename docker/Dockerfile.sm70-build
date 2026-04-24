@@ -90,8 +90,9 @@ RUN cd /build/csrc/flash_attention_v100 \
     && MAX_JOBS=${MAX_JOBS:-$(nproc)} NVCC_THREADS=${NVCC_THREADS} \
        CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST="7.0" \
        python3 setup.py build_ext --inplace \
-    && echo "SM70 kernel built at:" \
-    && ls -la /build/csrc/flash_attention_v100/*.so
+    && python3 -m pip install . --no-deps --break-system-packages \
+    && echo "SM70 kernel installed:" \
+    && python3 -c "import flash_attn_v100_cuda; print(flash_attn_v100_cuda)"
 
 # --- Build vLLM wheel ---
 # The kernel is already built in-tree; setup.py hook will skip redundant work.
