@@ -1,4 +1,4 @@
-# 1Cat-vLLM Agent Guide
+# GooseLLM Agent Guide
 
 ## One-Line Build
 
