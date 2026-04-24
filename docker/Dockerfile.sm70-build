@@ -47,11 +47,11 @@ RUN if [ -d /usr/local/cuda-12.8 ]; then ln -sf /usr/local/cuda-12.8 /usr/local/
 
 COPY requirements /tmp/requirements
 
-RUN pip3 install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
+RUN python3 -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --break-system-packages
 
-RUN pip3 install -r /tmp/requirements/cuda.txt --break-system-packages
+RUN python3 -m pip install -r /tmp/requirements/cuda.txt --break-system-packages
 
-RUN pip3 install 'setuptools>=77.0.3,<81.0.0' 'setuptools_scm>=8' grpcio-tools cmake build --break-system-packages
+RUN python3 -m pip install 'setuptools>=77.0.3,<81.0.0' 'setuptools_scm>=8' grpcio-tools cmake build --break-system-packages
 
 WORKDIR /build
 
@@ -63,14 +63,14 @@ RUN rm -rf build vllm.egg-info .deps
 RUN cd /build/csrc/flash_attention_v100 \
     && sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_available():/' setup.py \
     && MAX_JOBS=4 CUDA_HOME=/usr/local/cuda CMAKE_CUDA_ARCHITECTURES=70 TORCH_CUDA_ARCH_LIST="7.0" \
-       pip3 install . --no-build-isolation --break-system-packages
+       python3 -m pip install . --no-build-isolation --break-system-packages
 
 # Build vLLM wheel (matches 1Cat's original process)
 RUN cd /build \
     && rm -rf build vllm.egg-info .deps/*-build .deps/*-subbuild \
     && SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
        python3 -m build --wheel --no-isolation --outdir dist-cu128-sm70 \
-    && pip3 install dist-cu128-sm70/*.whl --no-deps --break-system-packages
+    && python3 -m pip install dist-cu128-sm70/*.whl --no-deps --break-system-packages
 
 WORKDIR /workspace
 EXPOSE 8000
