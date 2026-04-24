@@ -392,6 +392,24 @@ class cmake_build_ext(build_ext):
                 dirs_exist_ok=True,
             )
 
+        # Build SM70 FlashAttention kernel (unified repo)
+        kernel_dir = ROOT_DIR / "csrc" / "flash_attention_v100"
+        if kernel_dir.exists() and (kernel_dir / "setup.py").exists():
+            logger.info("Building SM70 flash_attention_v100 kernel...")
+            try:
+                subprocess.check_call(
+                    [sys.executable, "setup.py", "build_ext", "--inplace"],
+                    cwd=str(kernel_dir),
+                )
+                logger.info("SM70 kernel build completed.")
+            except subprocess.CalledProcessError as e:
+                logger.warning(
+                    "SM70 kernel build failed (optional): %s. "
+                    "You can build it manually: "
+                    "cd csrc/flash_attention_v100 && python setup.py build_ext --inplace",
+                    e,
+                )
+
 
 class precompiled_build_ext(build_ext):
     """Disables extension building when using precompiled binaries."""

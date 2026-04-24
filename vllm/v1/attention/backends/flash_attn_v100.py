@@ -47,6 +47,9 @@ def _iter_flash_attn_v100_roots():
     candidate_roots = []
     if env_root:
         candidate_roots.append(Path(env_root).expanduser())
+    # In-tree path (unified repo) — preferred
+    candidate_roots.append(repo_root / "csrc" / "flash_attention_v100")
+    # Legacy out-of-tree paths (backward compatibility)
     candidate_roots.extend([
         repo_root.parent / "flash-attention-v100-ai-bond",
         repo_root.parent / "flash-attention-v100",
