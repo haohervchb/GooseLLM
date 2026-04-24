@@ -4,9 +4,20 @@ High-throughput LLM inference on Tesla V100 GPUs with custom FlashAttention-2 ke
 
 ## Quick Start
 
-### Local Build (One-Line)
+### Local Build (Conda Environment)
+
+**Always use a Conda environment.** The build requires PyTorch with CUDA and specific compiler toolchains that are best isolated.
 
 ```bash
+# 1. Create and activate environment
+conda create -n goosellm python=3.12 -y
+conda activate goosellm
+
+# 2. Install PyTorch with CUDA 12.8
+pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+    --index-url https://download.pytorch.org/whl/cu128
+
+# 3. Clone and build
 git clone https://github.com/haohervchb/GooseLLM.git
 cd GooseLLM
 
@@ -14,7 +25,7 @@ cd GooseLLM
 MAX_JOBS=$(nproc) NVCC_THREADS=4 pip install -e . --no-build-isolation
 ```
 
-If vLLM's CMake build fails (optional extensions), the kernel is still usable:
+**If vLLM's CMake build fails** (optional extensions), the kernel is still usable:
 
 ```bash
 # Build only the SM70 kernel
