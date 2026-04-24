@@ -1,0 +1,45 @@
+[build-system]
+build-backend = "setuptools.build_meta"
+requires = [
+    "setuptools>=82.0.1",
+    "wheel>=0.46.3",
+    "packaging>=26.0",
+    "torch>=2.9.0,<2.10.0",
+    "ninja>=1.13.0",
+    "psutil>=7.2.2",
+    "numpy>=2.4.4"
+]
+
+
+[project]
+name = "flash_attn_v100"
+version = "26.04"
+description = "Flash Attention 2 for Tesla v100"
+readme = "README.md"
+requires-python = ">=3.10"
+license = {text = "BSD-3-Clause"}
+dynamic = ["authors", "classifiers", "urls"]
+dependencies = [
+    "torch>=2.9.0,<2.10.0",
+    "setuptools>=82.0.1",
+    "wheel>=0.46.3",
+    "packaging>=26.0",
+    "ninja>=1.13.0",
+    "psutil>=7.2.2",
+    "numpy>=2.4.4"
+]
+
+[tool.setuptools]
+packages = ["flash_attn_v100"]
+
+[tool.setuptools.exclude-package-data]
+"*" = [
+    "build",
+    "kernel",
+    "include",
+    "flash_attn_v100.egg-info",
+    "*.cu",
+    "*.cuh",
+    "*.cpp",
+    "*.h"
+]
