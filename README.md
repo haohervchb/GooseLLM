@@ -17,7 +17,10 @@ conda activate goosellm
 pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
     --index-url https://download.pytorch.org/whl/cu128
 
-# 3. Clone and build
+# 3. Install build dependencies (required for --no-build-isolation)
+pip install setuptools_scm cmake ninja build packaging wheel psutil
+
+# 4. Clone and build
 git clone https://github.com/haohervchb/GooseLLM.git
 cd GooseLLM
 

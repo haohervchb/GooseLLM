@@ -141,8 +141,9 @@ def get_cmdclass():
                     print(f"Warning: could not auto-tune build params: {e}")
                     pass
 
-            if not torch.cuda.is_available():
-                raise RuntimeError("CUDA is required but not available.")
+            # NOTE: torch.cuda.is_available() is intentionally NOT checked here.
+            # During Docker builds and CI, GPUs are not mounted but the CUDA
+            # toolkit is present. NVCC will fail if CUDA is truly missing.
             if parse(torch.version.cuda) < parse("11.6"):
                 raise RuntimeError(f"CUDA version {torch.version.cuda} < 11.6 is not supported. Please use CUDA ≥ 11.6 (e.g., PyTorch built with CUDA 11.8/12.x).")
             super().build_extensions()
