@@ -146,8 +146,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return False
         if self.kv_cache_dtype.startswith("fp8"):
             return False
-        if self.num_heads % 8 != 0:
-            return False
+        # NOTE: the paged kernel grid is (q_tiles, seqs, num_heads); each block
+        # handles one head independently, so any positive num_heads works.
         self._flash_attn_paged_ready = True
         return True
 
