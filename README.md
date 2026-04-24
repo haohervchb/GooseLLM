@@ -4,9 +4,7 @@ High-throughput LLM inference on Tesla V100 GPUs with custom FlashAttention-2 ke
 
 ## Quick Start
 
-### Docker Build (Recommended)
-
-Docker provides a hermetic build with the full CUDA 12.8 toolkit. This is the most reliable method.
+### Docker Build
 
 ```bash
 docker build \
@@ -15,46 +13,44 @@ docker build \
   .
 ```
 
-**Override CPU/thread count at build time:**
-
-```bash
-docker build \
-  -f docker/Dockerfile.sm70-build \
-  --build-arg MAX_JOBS=16 \
-  --build-arg NVCC_THREADS=4 \
-  -t goosellm:sm70 \
-  .
-```
-
-### Local Build (Conda Environment)
-
-**Note:** vLLM's upstream CMake build includes kernels for SM80+ (BF16/FP8) that fail to compile on SM70. Use the **two-step build** below.
+### Local Build
 
 ```bash
 # 1. Create and activate environment
 conda create -n goosellm python=3.12 -y
 conda activate goosellm
 
-# 2. Install PyTorch with CUDA 12.8
-pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+# 2. Install dependencies
+python -m pip install --upgrade pip setuptools wheel
+python -m pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
+python -m pip install -r requirements/cuda.txt
+python -m pip install cmake build
 
-# 3. Install build dependencies
-pip install setuptools_scm cmake ninja build packaging wheel psutil
+# 3. Set build environment
+export CUDA_HOME=/usr/local/cuda-12.8
+export PATH=$CUDA_HOME/bin:$PATH
+export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
+export VLLM_TARGET_DEVICE=cuda
+export VLLM_MAIN_CUDA_VERSION=12.8
+export TORCH_CUDA_ARCH_LIST=7.0
+export MAX_JOBS=$(nproc)
+export NVCC_THREADS=4
 
-# 4. Clone and build kernel
-git clone https://github.com/haohervchb/GooseLLM.git
-cd GooseLLM
-
+# 4. Build SM70 kernel
 cd csrc/flash_attention_v100
-MAX_JOBS=$(nproc) NVCC_THREADS=4 python setup.py build_ext --inplace
+sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_available():/' setup.py
+python setup.py build_ext --inplace
 cd ../..
 
-# 5. Install vLLM Python package (no C++ extensions needed for SM70)
-pip install -e . --no-build-isolation
-```
+# 5. Build vLLM wheel (matches 1Cat's original process)
+rm -rf build vllm.egg-info .deps/*-build .deps/*-subbuild
+SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
+  python -m build --wheel --no-isolation --outdir dist-cu128-sm70
 
-**Why two steps?** The SM70 kernel is built separately. vLLM's Python backend (`flash_attn_v100.py`) discovers it automatically. You do not need vLLM's `_C` / `_moe_C` extensions — they contain SM80+ only code.
+# 6. Install
+python -m pip install dist-cu128-sm70/*.whl --no-deps
+```
 
 ### Run Server
 
@@ -91,10 +87,9 @@ docker run --rm \
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `1stage` | Faster decode (direct P2P) |
 | `NCCL_P2P_LEVEL` | `NVL` | Force NVLink over PCIe |
 | `NCCL_MIN_NCHANNELS` | `4` | Better NCCL throughput |
-| `NCCL_MAX_NCHANNELS` | `4` | (if not using batch invariance) |
 
 **Do NOT use:**
-- `--disable-custom-all-reduce` (disables optimized P2P, hurts decode)
+- `--disable-custom-all-reduce` (disables optimized P2P)
 - `VLLM_DISABLE_PYNCCL=1` (unnecessary with custom AR)
 
 ## Model Support
@@ -103,13 +98,6 @@ docker run --rm \
 |-------|--------|--------|
 | Qwen3.5-122B-A10B-AWQ | TP=4, D=256 | ✅ Production |
 | Qwen3.6-35B-A3B-AWQ | TP=4, D=256 | ✅ Production |
-| Qwen3.6-27B (dense) | TP=4, D=256 | ✅ Expected |
-
-## Architecture
-
-- **Kernel**: `csrc/flash_attention_v100/` — FlashAttention-2 paged prefill for SM70
-- **Backend**: `vllm/v1/attention/backends/flash_attn_v100.py` — vLLM integration
-- **Build**: `setup.py` auto-discovers in-tree kernel; Docker uses all CPU threads
 
 ## References
 
