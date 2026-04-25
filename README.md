@@ -156,6 +156,10 @@ docker run --rm \
     --port 8000
 ```
 
+## Results
+
+![Comparison](tests/Comparison_QuantTrio_Qwen3.5-122B-A10B-AWQ_并发_1__vs_QuantTrio_Qwen3.6-27B-AWQ_QuantTrioQwen3.6-27B-AWQ_concurre.png)
+
 ## References
 
 - Original V100 kernel research: [ai-bond/flash-attention-v100](https://github.com/ai-bond/flash-attention-v100)
