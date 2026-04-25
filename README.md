@@ -1,6 +1,10 @@
 # GooseLLM — vLLM for NVIDIA V100 (SM70)
 
-High-throughput LLM inference on Tesla V100 GPUs with custom FlashAttention-2 kernel.
+High-throughput LLM inference on Tesla V100 GPUs with custom FlashAttention-2 kernel from ai-bond.
+
+## Acknowledgements
+
+Special thanks to [1CatAI](https://github.com/1CatAI/1Cat-vLLM) for their amazing V100 builds! Check out their repository for production-ready vLLM optimizations.
 
 ## Quick Start
 
@@ -52,7 +56,55 @@ SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
 python -m pip install dist-cu128-sm70/*.whl --no-deps
 ```
 
-### Run Server
+## Example Serving Commands
+
+Before running any of the commands below, make sure you're in the conda environment:
+
+```bash
+conda activate goosellm
+```
+
+### MoE Model (Qwen3.6-35B-A3B-AWQ)
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model QuantTrio/Qwen3.6-35B-A3B-AWQ \
+  --tensor-parallel-size 4 \
+  --dtype float16 \
+  --gpu-memory-utilization 0.80 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 16384 \
+  --trust-remote-code \
+  --attention-backend FLASH_ATTN_V100 \
+  --skip-mm-profiling \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### Dense Model (Qwen3.6-27B-AWQ)
+
+```bash
+python -m vllm.entrypoints.openai.api_server \
+  --model QuantTrio/Qwen3.6-27B-AWQ \
+  --tensor-parallel-size 4 \
+  --dtype float16 \
+  --gpu-memory-utilization 0.80 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --max-num-batched-tokens 16384 \
+  --trust-remote-code \
+  --attention-backend FLASH_ATTN_V100 \
+  --skip-mm-profiling \
+  --limit-mm-per-prompt '{"image":0,"video":0}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
+  --host 0.0.0.0 \
+  --port 8000
+```
+
+### Docker MoE (Qwen3.6-35B-A3B-AWQ/ 122B)
 
 ```bash
 docker run --rm \
@@ -60,11 +112,35 @@ docker run --rm \
   --ipc=host \
   -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
-  -e VLLM_CUSTOM_ALLREDUCE_ALGO=1stage \
   -e NCCL_P2P_LEVEL=NVL \
   goosellm:sm70 \
   python -m vllm.entrypoints.openai.api_server \
-    --model QuantTrio/Qwen3.5-122B-A10B-AWQ \
+    --model QuantTrio/Qwen3.6-35B-A3B-AWQ \
+    --quantization awq \
+    --dtype float16 \
+    --gpu-memory-utilization 0.8 \
+    --max-model-len 262144 \
+    --tensor-parallel-size 4 \
+    --max-num-seqs 1 \
+    --max-num-batched-tokens 16384 \
+    --skip-mm-profiling \
+    --attention-backend FLASH_ATTN_V100 \
+    --limit-mm-per-prompt '{"image":0,"video":0}' \
+    --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' 
+```
+
+### Docker Dense (Qwen3.6-27B-AWQ)
+
+```bash
+docker run --rm \
+  --gpus all \
+  --ipc=host \
+  -p 8000:8000 \
+  -v ~/.cache/huggingface:/root/.cache/huggingface \
+  -e NCCL_P2P_LEVEL=NVL \
+  goosellm:sm70 \
+  python -m vllm.entrypoints.openai.api_server \
+    --model QuantTrio/Qwen3.6-27B-AWQ \
     --quantization awq \
     --dtype float16 \
     --gpu-memory-utilization 0.8 \
@@ -79,25 +155,6 @@ docker run --rm \
     --host 0.0.0.0 \
     --port 8000
 ```
-
-## Performance Tuning
-
-| Environment Variable | Recommended Value | Effect |
-|---------------------|-------------------|--------|
-| `VLLM_CUSTOM_ALLREDUCE_ALGO` | `1stage` | Faster decode (direct P2P) |
-| `NCCL_P2P_LEVEL` | `NVL` | Force NVLink over PCIe |
-| `NCCL_MIN_NCHANNELS` | `4` | Better NCCL throughput |
-
-**Do NOT use:**
-- `--disable-custom-all-reduce` (disables optimized P2P)
-- `VLLM_DISABLE_PYNCCL=1` (unnecessary with custom AR)
-
-## Model Support
-
-| Model | Config | Status |
-|-------|--------|--------|
-| Qwen3.5-122B-A10B-AWQ | TP=4, D=256 | ✅ Production |
-| Qwen3.6-35B-A3B-AWQ | TP=4, D=256 | ✅ Production |
 
 ## References
 
