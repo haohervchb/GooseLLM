@@ -283,11 +283,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
             ),
             _seq_lens_cpu=None,
             _num_computed_tokens_cpu=None,
-            seq_lens_cpu_upper_bound=(
-                cad.seq_lens_cpu_upper_bound + num_query_per_req
-                if cad.seq_lens_cpu_upper_bound is not None
-                else None
-            ),
             num_reqs=cad.num_reqs,
             num_actual_tokens=num_query_total,
             max_query_len=num_query_per_req,
@@ -375,6 +370,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             - target_attn_layer_names
         )
         self.attn_layer_names = list(draft_attn_layer_names)
+        self.indexer_layer_names = []
 
     def _get_attention_metadata_builder(self):
         assert self.runner is not None
