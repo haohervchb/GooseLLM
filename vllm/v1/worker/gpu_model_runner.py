@@ -158,6 +158,7 @@ from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
+from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.structured_output.utils import apply_grammar_bitmask
 from vllm.v1.utils import CpuGpuBuffer, record_function_or_nullcontext
 from vllm.v1.worker import mamba_utils
@@ -5068,8 +5069,12 @@ class GPUModelRunner(
             if self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
+                or self.speculative_config.use_dflash()
             ):
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(
+                    self.drafter,
+                    EagleProposer | DraftModelProposer | DFlashProposer,
+                )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
                 # Therefore only use cudagraphs if the main model uses PIECEWISE
