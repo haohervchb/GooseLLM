@@ -12,7 +12,7 @@ from vllm.model_executor.model_loader import get_model
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
-from vllm.v1.attention.backend import CommonAttentionMetadata
+from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
