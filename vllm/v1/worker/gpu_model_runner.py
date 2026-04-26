@@ -450,6 +450,7 @@ class GPUModelRunner(
                 | EagleProposer
                 | DraftModelProposer
                 | MedusaProposer
+                | DFlashProposer
             )
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -463,6 +464,17 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.use_dflash():
+                from vllm.v1.spec_decode.dflash import DFlashProposer
+
+                self.drafter = DFlashProposer(
+                    vllm_config=self.vllm_config,
+                    device=self.device,
+                    runner=self,
+                )
+                # DFlash main model returns only last_hidden_states (not a tuple),
+                # unlike EAGLE3 which returns (last_hidden, aux_hidden).
+                self.use_aux_hidden_state_outputs = False
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -4089,6 +4101,84 @@ class GPUModelRunner(
                 target_hidden_states=hidden_states,
                 sampling_metadata=sampling_metadata,
                 slot_mappings=slot_mappings,
+            )
+        elif spec_config.use_dflash():
+            # DFlash uses a separate path since it generates all draft tokens
+            # in parallel with non-causal attention, unlike sequential EAGLE.
+            from vllm.v1.spec_decode.dflash import DFlashProposer
+
+            assert isinstance(sampled_token_ids, torch.Tensor)
+            assert isinstance(self.drafter, DFlashProposer)
+
+            num_rejected_tokens_gpu = None
+            if spec_decode_metadata is None:
+                # First spec step - prepare inputs from scheduled tokens
+                target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
+                target_positions = self._get_positions(num_scheduled_tokens)
+                if self.use_aux_hidden_state_outputs:
+                    assert aux_hidden_states is not None
+                    target_hidden_states = torch.cat(
+                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
+                    )
+                else:
+                    target_hidden_states = hidden_states[:num_scheduled_tokens]
+                # DFlash: next_token_ids = first element of each sampled token sequence
+                assert len(sampled_token_ids) == len(self.input_batch.req_ids)
+                next_token_ids = torch.tensor(
+                    [sampled_token_ids[i, 0] for i in range(len(sampled_token_ids))],
+                    dtype=torch.int32, device=self.device,
+                )
+                num_rejected_tokens_gpu = None
+            else:
+                # Subsequent spec steps - use padded batch path
+                if spec_config.disable_padded_drafter_batch:
+                    next_token_ids = self.drafter.prepare_next_token_ids_cpu(
+                        sampled_token_ids,
+                        self.requests,
+                        self.input_batch,
+                        scheduler_output.num_scheduled_tokens,
+                    )
+                else:
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            common_attn_metadata,
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
+                    self._copy_valid_sampled_token_count(
+                        next_token_ids, valid_sampled_tokens_count
+                    )
+
+                if self.use_aux_hidden_state_outputs:
+                    assert aux_hidden_states is not None
+                    target_hidden_states = torch.cat(
+                        [h[:num_scheduled_tokens] for h in aux_hidden_states], dim=-1
+                    )
+                else:
+                    target_hidden_states = hidden_states[:num_scheduled_tokens]
+                target_token_ids = self.input_ids.gpu[:num_scheduled_tokens]
+                target_positions = self._get_positions(num_scheduled_tokens)
+
+            if self.supports_mm_inputs and self.drafter.supports_mm_inputs:
+                mm_embed_inputs = self._gather_mm_embeddings(
+                    scheduler_output,
+                    shift_computed_tokens=1,
+                )
+            else:
+                mm_embed_inputs = None
+
+            draft_token_ids = self.drafter.propose(
+                target_token_ids=target_token_ids,
+                target_positions=target_positions,
+                target_hidden_states=target_hidden_states,
+                next_token_ids=next_token_ids,
+                common_attn_metadata=common_attn_metadata,
+                sampling_metadata=sampling_metadata,
+                mm_embed_inputs=mm_embed_inputs,
+                num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
         elif spec_config.use_eagle() or spec_config.uses_draft_model():
             assert isinstance(self.drafter, EagleProposer | DraftModelProposer)

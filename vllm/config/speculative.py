@@ -43,7 +43,8 @@ MTPModelTypes = Literal[
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
 ]
-EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes]
+DFlashModelTypes = Literal["dflash"]
+EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes, DFlashModelTypes]
 SpeculativeMethod = Literal[
     "ngram",
     "medusa",
@@ -158,6 +159,10 @@ class SpeculativeConfig:
     tokens with estimated probability (based on frequency counts) greater than
     or equal to this value."""
 
+    parallel_drafting: bool = False
+    """Whether the draft model generates all draft tokens in a single forward
+    pass (parallel drafting). This is set to True for DFlash."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -174,6 +179,9 @@ class SpeculativeConfig:
         # Eagle3 affects the computation graph because it returns intermediate
         # hidden states in addition to the final hidden state.
         factors.append(self.method == "eagle3")
+        # DFlash uses a non-causal attention mechanism that affects the graph.
+        factors.append(self.method == "dflash")
+        factors.append(self.parallel_drafting)
         hash_str = safe_hash(str(factors).encode(), usedforsecurity=False).hexdigest()
         return hash_str
 
@@ -399,7 +407,7 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3"):
+                if self.method in ("eagle", "eagle3", "dflash"):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -409,6 +417,8 @@ class SpeculativeConfig:
                     self.method = "eagle"
                 elif "eagle3" in self.draft_model_config.model.lower():
                     self.method = "eagle3"
+                elif "dflash" in self.draft_model_config.model.lower():
+                    self.method = "dflash"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -440,8 +450,8 @@ class SpeculativeConfig:
                         f"Unsupported speculative method: '{self.method}'"
                     )
 
-                # Replace hf_config for EAGLE draft_model
-                if self.method in ("eagle", "eagle3"):
+                # Replace hf_config for EAGLE/dFlash draft_model
+                if self.method in ("eagle", "eagle3", "dflash"):
                     from vllm.transformers_utils.configs import SpeculatorsConfig
                     from vllm.transformers_utils.configs.eagle import EAGLEConfig
 
@@ -473,6 +483,9 @@ class SpeculativeConfig:
                         )
                         self.draft_model_config._model_info = model_info
                         self.draft_model_config._architecture = arch
+
+                if self.method == "dflash":
+                    self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
                     self.draft_model_config.hf_config, "num_lookahead_tokens"
@@ -738,10 +751,13 @@ class SpeculativeConfig:
                 )
 
     def use_eagle(self) -> bool:
-        return self.method in ("eagle", "eagle3", "mtp")
+        return self.method in ("eagle", "eagle3", "mtp", "dflash")
 
     def uses_draft_model(self) -> bool:
         return self.method == "draft_model"
+
+    def use_dflash(self) -> bool:
+        return self.method == "dflash"
 
     def __repr__(self) -> str:
         method = self.method
