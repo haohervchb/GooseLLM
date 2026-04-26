@@ -1,9 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-from typing import Any
-
 import torch
+import torch.nn as nn
+from typing import Any
 from typing_extensions import override
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
