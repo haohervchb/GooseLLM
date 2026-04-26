@@ -6,7 +6,7 @@ from typing import Any
 import torch
 from typing_extensions import override
 
-from vllm.compilation.graph_edges import CUDAGraphMode
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config import VllmConfig
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
