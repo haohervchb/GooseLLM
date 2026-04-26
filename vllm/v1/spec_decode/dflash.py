@@ -6,8 +6,9 @@ from typing import Any
 import torch
 from typing_extensions import override
 
-from vllm.config.compilation import CUDAGraphMode
-from vllm.config import VllmConfig
+from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+from vllm.model_executor.model_loader import get_model
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
@@ -353,6 +354,31 @@ class DFlashProposer(SpecDecodeBaseProposer):
             dflash_cudagraph_mode = CUDAGraphMode.NONE
 
         self.cudagraph_dispatcher.initialize_cudagraph_keys(dflash_cudagraph_mode)
+
+    def load_model(self, target_model: nn.Module) -> None:
+        from vllm.compilation.backends import set_model_tag
+
+        draft_model_config = self.speculative_config.draft_model_config
+        target_attn_layer_names = set(
+            get_layers_from_vllm_config(
+                self.vllm_config,
+                AttentionLayerBase,
+            ).keys()
+        )
+
+        with set_model_tag("eagle_head"):
+            self.model = get_model(
+                vllm_config=self.vllm_config, model_config=draft_model_config
+            )
+
+        draft_attn_layer_names = (
+            get_layers_from_vllm_config(
+                self.vllm_config,
+                AttentionLayerBase,
+            ).keys()
+            - target_attn_layer_names
+        )
+        self.attn_layer_names = list(draft_attn_layer_names)
 
     def _get_attention_metadata_builder(self):
         assert self.runner is not None
