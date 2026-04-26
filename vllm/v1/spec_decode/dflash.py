@@ -427,7 +427,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
-        use_aux_hidden_state = True
+        use_aux_hidden_state = False
         dflash_config = getattr(
             self.draft_model_config.hf_config, "dflash_config", None
         )

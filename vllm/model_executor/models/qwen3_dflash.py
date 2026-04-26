@@ -233,7 +233,7 @@ class DFlashQwen3Model(nn.Module):
         if drafter_config is not None and "use_aux_hidden_state" in drafter_config:
             self.use_aux_hidden_state = drafter_config["use_aux_hidden_state"]
         else:
-            self.use_aux_hidden_state = True
+            self.use_aux_hidden_state = False
 
         current_vllm_config = get_current_vllm_config()
 
