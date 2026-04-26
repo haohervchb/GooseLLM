@@ -372,9 +372,27 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self.attn_layer_names = list(draft_attn_layer_names)
         self.indexer_layer_names = []
 
-    def _get_attention_metadata_builder(self):
-        assert self.runner is not None
-        return self.runner._make_spec_decode_attn_metadata_builder_()
+    def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
+        """Find and return the attention metadata builders for DFlash layers.
+        Returns the first builder that has any of the DFlash layer names.
+        """
+        from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
+
+        builder = None
+        chosen_layer = self.attn_layer_names[0]
+
+        for kv_cache_group in self.runner.attn_groups:
+            for attn_group in kv_cache_group:
+                if chosen_layer in attn_group.layer_names:
+                    builder = attn_group.get_metadata_builder()
+                    break
+            if builder is not None:
+                break
+
+        assert builder is not None, (
+            f"No attention metadata builder found for DFlash layer: {chosen_layer}"
+        )
+        return builder
 
     def dummy_run(
         self,
