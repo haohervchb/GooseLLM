@@ -400,28 +400,29 @@ class DFlashQwen3Model(nn.Module):
                 self._rms_norm_eps,
             )
 
-        # --- Fused RoPE across all layers ---
-        # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
-        # In-place RoPE: pass K as the "query" arg with key=None.
-        all_k_flat = all_k_normed.view(L * num_ctx, kv)
-        positions_repeated = context_positions.repeat(L)
-        cos_sin_cache = self._rope_cos_sin_cache
-        if cos_sin_cache.dtype != all_k_flat.dtype:
-            cos_sin_cache = cos_sin_cache.to(dtype=all_k_flat.dtype)
-        ops.rotary_embedding(
-            positions_repeated,
-            all_k_flat,
-            None,
-            self._rope_head_size,
-            cos_sin_cache,
-            self._rope_is_neox,
-        )
+        # --- Per-layer RoPE ---
+        # Apply RoPE to each layer separately since layer count varies
+        for i in range(L):
+            k_layer = all_k[i]
+            pos_layer = context_positions
+            cos_sin_cache = self._rope_cos_sin_cache
+            if cos_sin_cache.dtype != k_layer.dtype:
+                cos_sin_cache = cos_sin_cache.to(dtype=k_layer.dtype)
+            ops.rotary_embedding(
+                pos_layer,
+                k_layer,
+                None,
+                self._rope_head_size,
+                cos_sin_cache,
+                self._rope_is_neox,
+            )
+            all_k[i] = k_layer
 
         if context_slot_mapping is None:
             return
 
         # --- Per-layer cache insert ---
-        all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        all_k_final = all_k.view(L, num_ctx, nkv, hd)
         for i in range(L):
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
