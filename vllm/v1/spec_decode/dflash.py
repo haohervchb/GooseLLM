@@ -391,6 +391,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
         is_graph_capturing: bool = False,
         slot_mappings=None,
     ) -> None:
+        # DFlash dummy_run - skip actual forward during profile/warmup
+        # to avoid illegal memory access when KV cache isn't initialized
+        return
+
         num_query_tokens = min(num_tokens, self.max_query_tokens)
         num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
             num_tokens_unpadded=num_query_tokens, num_tokens_padded=num_query_tokens
