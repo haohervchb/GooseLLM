@@ -501,6 +501,8 @@ class DFlashQwen3Model(nn.Module):
 class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         nn.Module.__init__(self)
+        self.has_own_embed_tokens = False
+        self.has_own_lm_head = False
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)

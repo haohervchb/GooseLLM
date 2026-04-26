@@ -560,6 +560,9 @@ class TritonAttentionImpl(AttentionImpl):
             )
 
         # For decoder and cross-attention, use KV cache as before
+        # Skip if kv_cache is still the placeholder tensor from __init__
+        if kv_cache.numel() == 0:
+            return output
         key_cache, value_cache = kv_cache.unbind(1)
         if self.kv_cache_dtype.startswith("fp8"):
             assert self.fp8_dtype is not None
@@ -719,6 +722,10 @@ class TritonAttentionImpl(AttentionImpl):
         if self.attn_type in (AttentionType.ENCODER_ONLY, AttentionType.ENCODER):
             # For encoder attention,
             # we use direct Q, K, V tensors without caching
+            return
+        # Skip if kv_cache is still the placeholder tensor from __init__
+        # This happens for draft model layers that haven't been bound yet.
+        if kv_cache.numel() == 0:
             return
         # For decoder and cross-attention, use KV cache as before
         key_cache, value_cache = kv_cache.unbind(1)

@@ -348,11 +348,15 @@ class DFlashProposer(SpecDecodeBaseProposer):
         slot_mappings=None,
     ) -> None:
         num_query_tokens = min(num_tokens, self.max_query_tokens)
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._pad_batch_across_dp(
-                num_tokens_unpadded=num_query_tokens, num_tokens_padded=num_query_tokens
-            )
+        num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
+            num_tokens_unpadded=num_query_tokens, num_tokens_padded=num_query_tokens
         )
+        cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+            num_tokens_dp_padded
+        )
+        num_input_tokens = batch_desc.num_tokens
+        if num_tokens_across_dp is not None:
+            num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
         slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
 

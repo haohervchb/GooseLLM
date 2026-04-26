@@ -307,6 +307,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         head_dim = query.shape[2]
 
         # Extract K/V from paged KV cache: [num_blocks, 2, block_size, num_kv_heads, head_size]
+        if kv_cache.numel() == 0:
+            return output
         key_cache, value_cache = kv_cache.unbind(1)
 
         # Only copy if non-contiguous (vLLM cache is usually already contiguous)
