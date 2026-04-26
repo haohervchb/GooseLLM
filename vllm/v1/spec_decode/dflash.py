@@ -165,11 +165,14 @@ class DFlashProposer(SpecDecodeBaseProposer):
             for layer_name in self.indexer_layer_names:
                 per_layer_attn_metadata[layer_name] = draft_indexer_metadata
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._pad_batch_across_dp(
+        num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
                 num_tokens_unpadded=num_query, num_tokens_padded=num_query
             )
+
+        cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
+            num_tokens_dp_padded
         )
+        num_input_tokens = batch_desc.num_tokens
 
         # Pre-insert context KVs directly into cache (DFlash-specific)
         self.model.precompute_and_store_context_kv(
