@@ -3822,9 +3822,9 @@ class GPUModelRunner(
                 spec_config.use_eagle() or spec_config.uses_draft_model()
             ) and not spec_config.disable_padded_drafter_batch
             if use_gpu_toks:
-                # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
+                # EAGLE/DraftModel/DFlash speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
-                assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+                assert isinstance(self.drafter, EagleProposer | DraftModelProposer | DFlashProposer)
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
                     propose_draft_token_ids(sampled_token_ids)
@@ -4181,8 +4181,8 @@ class GPUModelRunner(
                 mm_embed_inputs=mm_embed_inputs,
                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
             )
-        elif spec_config.use_eagle() or spec_config.uses_draft_model():
-            assert isinstance(self.drafter, EagleProposer | DraftModelProposer)
+        elif spec_config.use_eagle() or spec_config.uses_draft_model() or spec_config.use_dflash():
+            assert isinstance(self.drafter, EagleProposer | DraftModelProposer | DFlashProposer)
 
             if spec_config.disable_padded_drafter_batch:
                 # When padded-batch is disabled, the sampled_token_ids should be
