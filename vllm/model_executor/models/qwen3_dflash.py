@@ -425,6 +425,8 @@ class DFlashQwen3Model(nn.Module):
         for i in range(L):
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
+            if isinstance(kv_cache, list):
+                kv_cache = kv_cache[0]
             attn.impl.do_kv_cache_update(
                 attn,
                 all_k_final[i],
