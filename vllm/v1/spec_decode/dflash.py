@@ -48,6 +48,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         self.method = "dflash"
 
+        self._init_parallel_drafting_params()
+
         # DFlash: only next_token_ids + mask tokens are query tokens
         self.max_query_tokens = self.max_batch_size * (1 + self.num_speculative_tokens)
         # Positions covers both context states + query states
@@ -95,14 +97,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def _init_parallel_drafting_params(self):
         """Initialize DFlash mask token handling for parallel drafting."""
         model_hf_config = self.draft_model_config.hf_config
-        dflash_config = getattr(model_hf_config, "dflash_config", None)
-        if dflash_config and "mask_token_id" in dflash_config:
-            self.parallel_drafting_token_id = dflash_config["mask_token_id"]
-        else:
-            raise ValueError(
-                "For DFlash parallel drafting, the draft model config must have "
-                "`dflash_config.mask_token_id` specified in its config.json."
-            )
+        dflash_config = getattr(model_hf_config, "dflash_config", {})
+        self.parallel_drafting_token_id = dflash_config.get("mask_token_id", 151643)
 
         # Initialize hidden state tensor for mask embeddings
         self.parallel_drafting_hidden_state_tensor = torch.empty(
