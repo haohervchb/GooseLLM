@@ -336,6 +336,23 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def model_returns_tuple(self) -> bool:
         return False
 
+    def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
+        """Initialize cudagraph dispatcher keys for DFlash.
+
+        DFlash only supports PIECEWISE cudagraphs (via mixed_mode).
+        This should be called after adjust_cudagraph_sizes_for_spec_decode.
+        """
+        if (
+            not self.speculative_config.enforce_eager
+            and cudagraph_mode.mixed_mode()
+            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
+        ):
+            dflash_cudagraph_mode = CUDAGraphMode.PIECEWISE
+        else:
+            dflash_cudagraph_mode = CUDAGraphMode.NONE
+
+        self.cudagraph_dispatcher.initialize_cudagraph_keys(dflash_cudagraph_mode)
+
     def _get_attention_metadata_builder(self):
         assert self.runner is not None
         return self.runner._make_spec_decode_attn_metadata_builder_()
