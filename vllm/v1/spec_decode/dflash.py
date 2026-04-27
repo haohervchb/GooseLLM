@@ -175,10 +175,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_input_tokens = batch_desc.num_tokens
 
         # Pre-insert context KVs directly into cache (DFlash-specific)
+        num_context = self._dflash_num_context
         self.model.precompute_and_store_context_kv(
             self._dflash_hidden_states,
-            self._context_positions_buffer[: common_attn_metadata.num_actual_tokens],
-            self._context_slot_mapping_buffer[: common_attn_metadata.num_actual_tokens],
+            self._context_positions_buffer[:num_context],
+            self._context_slot_mapping_buffer[:num_context],
         )
 
         # Build model inputs
@@ -440,7 +441,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             )
 
     def _get_eagle3_use_aux_hidden_state_from_config(self) -> bool:
-        use_aux_hidden_state = False
+        use_aux_hidden_state = True
         dflash_config = getattr(
             self.draft_model_config.hf_config, "dflash_config", None
         )
