@@ -7,8 +7,10 @@ from typing import Any
 from typing_extensions import override
 
 from vllm.config import CUDAGraphMode, VllmConfig, get_layers_from_vllm_config
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
+from vllm.model_executor.models.interfaces import SupportsMultiModal
 from vllm.forward_context import set_forward_context
 from vllm.logger import init_logger
 from vllm.triton_utils import triton
@@ -120,13 +122,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
     ) -> torch.Tensor:
         batch_size = common_attn_metadata.batch_size()
 
-        # Combine hidden states for DFlash (auxiliary layer extraction)
-        if getattr(self, "eagle3_use_aux_hidden_state", False) and hasattr(
-            self.model, "combine_hidden_states"
-        ):
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
+        # NOTE: DFlash does NOT use combine_hidden_states; the fc layer in the
+        # draft model maps concatenated multi-layer features back to hidden_size,
+        # but during inference the draft model only returns the final hidden state.
+        # The upstream DFlash proposer never calls combine_hidden_states.
 
         # Run DFlash-specific input setup (non-causal attention)
         num_query, token_indices_to_sample, common_attn_metadata = (
@@ -182,6 +181,56 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self._context_slot_mapping_buffer[:num_context],
         )
 
+        # DEBUG: verify KV cache binding and NaN for draft layers
+        for layer_name in self.attn_layer_names:
+            layer = self.runner.compilation_config.static_forward_context.get(
+                layer_name
+            )
+            if layer is None:
+                logger.warning("DFlash propose: layer %s not in forward context", layer_name)
+                continue
+            kv_cache = getattr(layer, "kv_cache", None)
+            if kv_cache is None:
+                logger.warning("DFlash propose: layer %s has no kv_cache", layer_name)
+            elif isinstance(kv_cache, list):
+                if len(kv_cache) == 0:
+                    logger.warning("DFlash propose: layer %s kv_cache is empty list", layer_name)
+                elif hasattr(kv_cache[0], "numel"):
+                    cache_tensor = kv_cache[0]
+                    logger.info(
+                        "DFlash propose: layer %s kv_cache shape=%s numel=%d",
+                        layer_name,
+                        cache_tensor.shape,
+                        cache_tensor.numel(),
+                    )
+                    if torch.isnan(cache_tensor).any():
+                        logger.warning("DFlash propose: layer %s KV cache has NaN", layer_name)
+                    if torch.isinf(cache_tensor).any():
+                        logger.warning("DFlash propose: layer %s KV cache has Inf", layer_name)
+                else:
+                    logger.warning(
+                        "DFlash propose: layer %s kv_cache[0] type=%s",
+                        layer_name,
+                        type(kv_cache[0]).__name__,
+                    )
+            elif hasattr(kv_cache, "numel"):
+                logger.info(
+                    "DFlash propose: layer %s kv_cache shape=%s numel=%d",
+                    layer_name,
+                    kv_cache.shape,
+                    kv_cache.numel(),
+                )
+                if torch.isnan(kv_cache).any():
+                    logger.warning("DFlash propose: layer %s KV cache has NaN", layer_name)
+                if torch.isinf(kv_cache).any():
+                    logger.warning("DFlash propose: layer %s KV cache has Inf", layer_name)
+            else:
+                logger.warning(
+                    "DFlash propose: layer %s kv_cache type=%s",
+                    layer_name,
+                    type(kv_cache).__name__,
+                )
+
         # Build model inputs
         input_ids = self.input_ids[:num_input_tokens]
         inputs_embeds = None
@@ -200,18 +249,53 @@ class DFlashProposer(SpecDecodeBaseProposer):
             slot_mapping={name: self._slot_mapping_buffer[:num_input_tokens] for name in self.attn_layer_names},
         ):
             ret_hidden_states = self.model(**model_kwargs)
-            if not self.model_returns_tuple():
-                sample_hidden_states = ret_hidden_states[token_indices_to_sample]
-            else:
-                _, sample_hidden_states = ret_hidden_states[token_indices_to_sample]
+
+        # DEBUG: detect NaN in draft hidden states
+        if torch.isnan(ret_hidden_states).any():
+            logger.warning(
+                "DFlash propose: ret_hidden_states contains NaN (shape=%s)",
+                ret_hidden_states.shape,
+            )
+        if torch.isinf(ret_hidden_states).any():
+            logger.warning(
+                "DFlash propose: ret_hidden_states contains Inf (shape=%s)",
+                ret_hidden_states.shape,
+            )
+
+        if not self.model_returns_tuple():
+            sample_hidden_states = ret_hidden_states[token_indices_to_sample]
+        else:
+            _, sample_hidden_states = ret_hidden_states[token_indices_to_sample]
 
         # Greedy sample from mask token positions
         if self.use_local_argmax_reduction:
             draft_token_ids = self.model.get_top_tokens(sample_hidden_states)
         else:
-            draft_token_ids = self.model.compute_logits(sample_hidden_states).argmax(
-                dim=-1
-            )
+            logits = self.model.compute_logits(sample_hidden_states)
+            # DEBUG: check for NaN/Inf in draft logits
+            if logits is not None:
+                has_nan = torch.isnan(logits).any().item()
+                has_inf = torch.isinf(logits).any().item()
+                if has_nan or has_inf:
+                    logger.warning(
+                        "DFlash draft logits NaN=%s Inf=%s stats: min=%s max=%s mean=%s",
+                        has_nan,
+                        has_inf,
+                        logits.min().item() if not has_nan else "nan",
+                        logits.max().item() if not has_nan else "nan",
+                        logits.mean().item() if not has_nan else "nan",
+                    )
+            draft_token_ids = logits.argmax(dim=-1)
+
+        # DEBUG: log draft token distribution
+        unique, counts = torch.unique(draft_token_ids, return_counts=True)
+        top_counts, top_idx = torch.topk(counts, min(5, len(counts)))
+        logger.info(
+            "DFlash draft tokens unique=%d top_ids=%s top_counts=%s",
+            len(unique),
+            unique[top_idx].tolist(),
+            top_counts.tolist(),
+        )
 
         # Reshape to [batch_size, num_spec_tokens]
         # draft_token_ids is [batch_size * num_speculative_tokens]
@@ -336,19 +420,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
     def initialize_cudagraph_keys(self, cudagraph_mode: CUDAGraphMode) -> None:
         """Initialize cudagraph dispatcher keys for DFlash.
 
-        DFlash only supports PIECEWISE cudagraphs (via mixed_mode).
-        This should be called after adjust_cudagraph_sizes_for_spec_decode.
+        DFlash draft model is very small (5 layers); CUDA graphs offer
+        little benefit and can trigger custom-all-reduce IPC issues when
+        captured inside the target model's graph capture context.
+        We force NONE to keep the draft model on the eager path.
         """
-        if (
-            not self.speculative_config.enforce_eager
-            and cudagraph_mode.mixed_mode()
-            in [CUDAGraphMode.PIECEWISE, CUDAGraphMode.FULL]
-        ):
-            dflash_cudagraph_mode = CUDAGraphMode.PIECEWISE
-        else:
-            dflash_cudagraph_mode = CUDAGraphMode.NONE
-
-        self.cudagraph_dispatcher.initialize_cudagraph_keys(dflash_cudagraph_mode)
+        self.cudagraph_dispatcher.initialize_cudagraph_keys(CUDAGraphMode.NONE)
 
     def load_model(self, target_model: nn.Module) -> None:
         from vllm.compilation.backends import set_model_tag
@@ -375,6 +452,67 @@ class DFlashProposer(SpecDecodeBaseProposer):
         )
         self.attn_layer_names = list(draft_attn_layer_names)
         self.indexer_layer_names = []
+
+        # Share embed_tokens with the target model if the draft checkpoint
+        # does not contain its own embedding weights.
+        if get_pp_group().world_size == 1:
+            if isinstance(target_model, SupportsMultiModal):
+                target_language_model = target_model.get_language_model()
+            else:
+                target_language_model = target_model
+            inner_model = getattr(target_language_model, "model", None)
+            if inner_model is not None:
+                if hasattr(inner_model, "embed_tokens"):
+                    target_embed_tokens = inner_model.embed_tokens
+                elif hasattr(inner_model, "embedding"):
+                    target_embed_tokens = inner_model.embedding
+                else:
+                    target_embed_tokens = None
+
+                has_own_embed = getattr(self.model, "has_own_embed_tokens", False)
+                logger.info(
+                    "DFlash load_model: target_embed_tokens=%s has_own_embed_tokens=%s",
+                    target_embed_tokens is not None,
+                    has_own_embed,
+                )
+                if target_embed_tokens is not None and not has_own_embed:
+                    logger.info(
+                        "DFlash draft model does not have its own embed_tokens. "
+                        "Sharing target model embedding weights with the draft model."
+                    )
+                    if hasattr(self.model.model, "embed_tokens"):
+                        del self.model.model.embed_tokens
+                    self.model.model.embed_tokens = target_embed_tokens
+                elif target_embed_tokens is not None:
+                    logger.info(
+                        "DFlash draft model has its own embed_tokens. Keeping separate."
+                    )
+                else:
+                    logger.warning(
+                        "DFlash draft model: target_embed_tokens not found."
+                    )
+
+            # Share lm_head with the target model if the draft checkpoint
+            # does not contain its own lm_head weights.
+            target_lm_head = getattr(target_language_model, "lm_head", None)
+            has_own_lm_head = getattr(self.model, "has_own_lm_head", False)
+            logger.info(
+                "DFlash load_model: target_lm_head=%s has_own_lm_head=%s",
+                target_lm_head is not None,
+                has_own_lm_head,
+            )
+            if target_lm_head is not None and not has_own_lm_head:
+                logger.info(
+                    "DFlash draft model does not have its own lm_head. "
+                    "Sharing target model lm_head weights with the draft model."
+                )
+                if hasattr(self.model, "lm_head"):
+                    del self.model.lm_head
+                self.model.lm_head = target_lm_head
+            elif target_lm_head is not None:
+                logger.info(
+                    "DFlash draft model has its own lm_head. Keeping separate."
+                )
 
     def _get_attention_metadata_builder(self) -> AttentionMetadataBuilder:
         """Find and return the attention metadata builders for DFlash layers.
@@ -405,23 +543,28 @@ class DFlashProposer(SpecDecodeBaseProposer):
         is_graph_capturing: bool = False,
         slot_mappings=None,
     ) -> None:
-        # DFlash dummy_run - skip actual forward during profile/warmup
-        # to avoid illegal memory access when KV cache isn't initialized
-        return
+        """Warm-up the draft model to trigger torch.compile tracing.
 
+        DFlash only needs one forward pass due to parallel drafting.
+        We deliberately avoid CUDA graphs for the draft model to prevent
+        nested-capture issues with custom all-reduce.
+        """
         num_query_tokens = min(num_tokens, self.max_query_tokens)
         num_tokens_dp_padded, num_tokens_across_dp = self._pad_batch_across_dp(
             num_tokens_unpadded=num_query_tokens, num_tokens_padded=num_query_tokens
         )
-        cudagraph_runtime_mode, batch_desc = self.cudagraph_dispatcher.dispatch(
-            num_tokens_dp_padded
-        )
-        num_input_tokens = batch_desc.num_tokens
+
+        # Force eager execution for the draft model warm-up
+        cudagraph_runtime_mode = CUDAGraphMode.NONE
+        num_input_tokens = num_tokens_dp_padded
         if num_tokens_across_dp is not None:
             num_tokens_across_dp[self.dp_rank] = num_input_tokens
 
         slot_mapping_dict = self._get_slot_mapping(num_input_tokens)
 
+        # Use dummy buffers for context states; no actual KV write happens
+        # because precompute_and_store_context_kv returns early when
+        # context_slot_mapping is None.
         context_positions = self._context_positions_buffer[:num_tokens]
         context_states = self.hidden_states[:num_tokens]
 

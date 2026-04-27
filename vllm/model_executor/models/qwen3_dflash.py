@@ -370,6 +370,12 @@ class DFlashQwen3Model(nn.Module):
         hd = self._head_dim
         nkv = self._num_kv_heads
 
+        # DEBUG: check input context states
+        if torch.isnan(context_states).any():
+            logger.warning("DFlash precompute: context_states input has NaN")
+        if torch.isinf(context_states).any():
+            logger.warning("DFlash precompute: context_states input has Inf")
+
         # --- Fused KV projection (one GEMM for all layers) ---
         normed_context_states = torch.empty_like(context_states)
         ops.rms_norm(
@@ -378,9 +384,19 @@ class DFlashQwen3Model(nn.Module):
             self._hidden_norm_weight,
             self._rms_norm_eps,
         )
+        if torch.isnan(normed_context_states).any():
+            logger.warning("DFlash precompute: normed_context_states has NaN after hidden_norm")
+        if torch.isinf(normed_context_states).any():
+            logger.warning("DFlash precompute: normed_context_states has Inf after hidden_norm")
+
         all_kv_flat = F.linear(
             normed_context_states, self._fused_kv_weight, self._fused_kv_bias
         )
+        if torch.isnan(all_kv_flat).any():
+            logger.warning("DFlash precompute: all_kv_flat has NaN after fused projection")
+        if torch.isinf(all_kv_flat).any():
+            logger.warning("DFlash precompute: all_kv_flat has Inf after fused projection")
+
         # Single contiguous copy that separates K/V and transposes to
         # layer-major layout.  Result: [2, L, num_ctx, nkv, hd] contiguous.
         # Indexing dim-0 gives contiguous [L, num_ctx, nkv, hd] for K and V.
@@ -389,6 +405,10 @@ class DFlashQwen3Model(nn.Module):
         )
         all_k = all_kv[0]  # [L, num_ctx, nkv, hd], contiguous
         all_v = all_kv[1]  # [L, num_ctx, nkv, hd], contiguous
+        if torch.isnan(all_k).any():
+            logger.warning("DFlash precompute: all_k has NaN after split")
+        if torch.isnan(all_v).any():
+            logger.warning("DFlash precompute: all_v has NaN after split")
 
         # --- Per-layer RMSNorm K (3D: [num_ctx, nkv, hd] per layer) ---
         all_k_normed = torch.empty_like(all_k)
@@ -399,6 +419,10 @@ class DFlashQwen3Model(nn.Module):
                 self._k_norm_weights[i],
                 self._rms_norm_eps,
             )
+        if torch.isnan(all_k_normed).any():
+            logger.warning("DFlash precompute: all_k_normed has NaN after k_norm")
+        if torch.isinf(all_k_normed).any():
+            logger.warning("DFlash precompute: all_k_normed has Inf after k_norm")
 
         # --- Fused RoPE across all layers ---
         # View as [L * num_ctx, kv] so RoPE sees one big batch (no copy).
@@ -416,15 +440,27 @@ class DFlashQwen3Model(nn.Module):
             cos_sin_cache,
             self._rope_is_neox,
         )
+        if torch.isnan(all_k_flat).any():
+            logger.warning("DFlash precompute: all_k_flat has NaN after RoPE")
+        if torch.isinf(all_k_flat).any():
+            logger.warning("DFlash precompute: all_k_flat has Inf after RoPE")
 
         if context_slot_mapping is None:
             return
 
         # --- Per-layer cache insert ---
         all_k_final = all_k_flat.view(L, num_ctx, nkv, hd)
+        if torch.isnan(all_k_final).any():
+            logger.warning("DFlash precompute: all_k_final has NaN before cache write")
+        if torch.isnan(all_v).any():
+            logger.warning("DFlash precompute: all_v has NaN before cache write")
         for i in range(L):
             attn = self._attn_layers[i]
             kv_cache = attn.kv_cache
+            # GooseLLM stores kv_cache as a list per PP rank (unlike upstream
+            # which uses a single tensor). Select the cache for rank 0.
+            if isinstance(kv_cache, list):
+                kv_cache = kv_cache[0]
             attn.impl.do_kv_cache_update(
                 attn,
                 all_k_final[i],
@@ -594,6 +630,7 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         model_weights = {}
         includes_draft_id_mapping = False
         includes_embed_tokens = False
+        includes_lm_head = False
         for name, loaded_weight in weights:
             assert "mask_hidden" not in name, (
                 "DFlash should use mask_token_id to embed the padding hidden state"
@@ -607,6 +644,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
                 name = "model." + name
             if "embed_tokens" in name:
                 includes_embed_tokens = True
+            if "lm_head" in name:
+                includes_lm_head = True
             model_weights[name] = loaded_weight
             process_eagle_weight(self, name)
 
@@ -615,6 +654,8 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_substrs.append("draft_id_to_target_id")
         if not includes_embed_tokens:
             skip_substrs.append("embed_tokens")
+        if not includes_lm_head:
+            skip_substrs.append("lm_head")
         if not self.model.use_aux_hidden_state:
             skip_substrs.append("fc.")
         loader = AutoWeightsLoader(
@@ -622,5 +663,12 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
             skip_prefixes=None,
             skip_substrs=skip_substrs,
         )
-        loader.load_weights(model_weights.items())
+        loaded_params = loader.load_weights(model_weights.items())
+        # Mark skipped shared weights as loaded so DefaultModelLoader
+        # doesn't complain; they will be replaced with target model weights.
+        if not includes_embed_tokens:
+            loaded_params.add("model.embed_tokens.weight")
+        if not includes_lm_head:
+            loaded_params.add("lm_head.weight")
         self.model._build_fused_kv_buffers()
+        return loaded_params

@@ -3665,6 +3665,18 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
+            # DEBUG: check target model hidden states for NaN/Inf
+            if torch.isnan(hidden_states).any():
+                logger.warning(
+                    "Target model hidden_states has NaN (shape=%s)",
+                    hidden_states.shape,
+                )
+            if torch.isinf(hidden_states).any():
+                logger.warning(
+                    "Target model hidden_states has Inf (shape=%s)",
+                    hidden_states.shape,
+                )
+
             if not self.broadcast_pp_output:
                 # Common case.
                 if not get_pp_group().is_last_rank:
@@ -4170,6 +4182,22 @@ class GPUModelRunner(
                 )
             else:
                 mm_embed_inputs = None
+
+            # DEBUG: check target hidden states before draft proposal
+            if torch.isnan(target_hidden_states).any():
+                logger.warning(
+                    "DFlash runner: target_hidden_states has NaN before propose "
+                    "(shape=%s num_scheduled=%d)",
+                    target_hidden_states.shape,
+                    num_scheduled_tokens,
+                )
+            if torch.isinf(target_hidden_states).any():
+                logger.warning(
+                    "DFlash runner: target_hidden_states has Inf before propose "
+                    "(shape=%s num_scheduled=%d)",
+                    target_hidden_states.shape,
+                    num_scheduled_tokens,
+                )
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
@@ -6256,6 +6284,43 @@ class GPUModelRunner(
         kv_caches = self.initialize_kv_cache_tensors(
             kv_cache_config, kernel_block_sizes
         )
+        # Stash the dict so we can bind draft-model layers after they are loaded
+        self.kv_caches_dict = kv_caches
+
+        # Safety: bind KV caches for draft-model layers that were added
+        # after the initial bind_kv_cache() call.
+        if hasattr(self, "drafter") and self.drafter is not None:
+            bound_count = 0
+            for layer_name, kv_cache in self.kv_caches_dict.items():
+                if layer_name not in self.compilation_config.static_forward_context:
+                    continue
+                layer = self.compilation_config.static_forward_context[layer_name]
+                if not hasattr(layer, "kv_cache"):
+                    continue
+                current = layer.kv_cache
+                needs_bind = False
+                if isinstance(current, list):
+                    if len(current) == 0:
+                        needs_bind = True
+                    elif isinstance(current[0], torch.Tensor):
+                        if current[0].numel() == 0:
+                            needs_bind = True
+                    elif isinstance(current[0], list) and len(current[0]) == 0:
+                        needs_bind = True
+                elif isinstance(current, torch.Tensor) and current.numel() == 0:
+                    needs_bind = True
+                if needs_bind:
+                    layer.kv_cache = [kv_cache]
+                    bound_count += 1
+                    logger.info(
+                        "Bound KV cache for draft layer %s (shape=%s)",
+                        layer_name,
+                        kv_cache.shape if hasattr(kv_cache, "shape") else "N/A",
+                    )
+            if bound_count:
+                logger.info(
+                    "Bound KV caches for %d draft layers", bound_count
+                )
 
         if self.speculative_config and (
             self.speculative_config.use_eagle()

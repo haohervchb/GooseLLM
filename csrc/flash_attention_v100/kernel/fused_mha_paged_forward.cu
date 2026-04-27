@@ -122,7 +122,12 @@ flash_attention_paged_forward_kernel(
 
     // ---- Shared memory ----
     extern __shared__ char smem_raw[];
-    
+
+    // Zero-fill entire shared memory to prevent garbage from previous SM
+    // occupant from leaking into partial tiles (critical for causal=False).
+    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    __syncthreads();
+
     // Reinterpret parsed into struct fields
     auto& _s = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
     __half* sQ   = _s.q;
@@ -474,6 +479,10 @@ flash_attention_paged_forward_kernel_gqa_shared_kv(
 
     // ---- Shared memory ----
     extern __shared__ char smem_raw[];
+
+    WMMA_GEMM_INIT_SMEM<Config>(smem_raw);
+    __syncthreads();
+
     auto& _s = *reinterpret_cast<typename Config::SmemLayout*>(smem_raw);
     __half* sQ = _s.q;
     __half* sK = _s.reuse_kv.k;

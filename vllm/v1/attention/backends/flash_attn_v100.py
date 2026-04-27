@@ -118,6 +118,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata = super().build(common_prefix_len, common_attn_metadata, fast_build)
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         attn_metadata.seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        # Propagate causal flag for DFlash non-causal attention support
+        attn_metadata.causal = getattr(common_attn_metadata, "causal", True)
         return attn_metadata
 
 
@@ -199,6 +201,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _warned_missing_flash_ops = True
 
+        causal = getattr(attn_metadata, "causal", True)
         if not self._supports_flash_v100_path():
             if self.use_flash_v100 and not _warned_feature_fallback:
                 logger.warning(
@@ -206,6 +209,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "attention features (alibi/softcap/sliding window/fp8/etc)."
                 )
                 _warned_feature_fallback = True
+            if not causal:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 cannot fall back to Triton for non-causal "
+                    "attention (required by DFlash). Please ensure the paged "
+                    "kernel is ready (no alibi/softcap/sliding_window/fp8)."
+                )
             return super().forward(
                 layer,
                 query,
@@ -229,6 +238,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         "capture. Using Triton path for capture safety."
                     )
                     _warned_prefill_fallback = True
+                if not causal:
+                    raise RuntimeError(
+                        "FLASH_ATTN_V100 cannot fall back to Triton for non-causal "
+                        "attention during CUDA graph capture (required by DFlash). "
+                        "Please disable CUDA graphs for the draft model."
+                    )
                 return super().forward(
                     layer,
                     query,
@@ -247,6 +262,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         "(head dim, device, or feature mismatch). Using Triton."
                     )
                     _warned_prefill_fallback = True
+                if not causal:
+                    raise RuntimeError(
+                        "FLASH_ATTN_V100 cannot fall back to Triton for non-causal "
+                        "attention when paged kernel is not ready (required by DFlash). "
+                        "Please ensure the paged kernel supports your config."
+                    )
                 return super().forward(
                     layer,
                     query,
@@ -336,6 +357,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         # Call paged kernel with native GQA support.
         # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
+        causal = getattr(attn_metadata, "causal", True)
         _unused_out, softmax_lse = self.flash_attn_paged(
             query,
             k_cache,
@@ -347,7 +369,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             out=out_view,
             block_size=block_size,
             softmax_scale=softmax_scale,
-            causal=True,
+            causal=causal,
             num_kv_heads=num_heads_kv,
         )
 
