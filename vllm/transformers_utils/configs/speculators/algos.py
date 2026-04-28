@@ -39,3 +39,27 @@ def update_eagle3(config_dict: dict, pre_trained_config: dict) -> None:
         pre_trained_config["eagle_aux_hidden_state_layer_ids"] = config_dict[
             "eagle_aux_hidden_state_layer_ids"
         ]
+
+
+@register_speculator("dflash")
+def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
+    """Apply DFlash-specific configuration to the draft model config.
+
+    DFlash specific fields:
+    - mask_token_id (required): Token ID used for parallel drafting mask placeholders
+    - target_hidden_size: Hidden size of the target model
+    - aux_hidden_state_layer_ids (required): Layer indices from target model used
+      as context for DFlash drafter. Mapped to eagle_aux_hidden_state_layer_ids
+      and dflash_config.target_layer_ids.
+    """
+    pre_trained_config["architectures"] = ["DFlashDraftModel"]
+    pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
+    if config_dict.get("target_hidden_size") is not None:
+        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+
+    aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
+    pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids
+    pre_trained_config["dflash_config"] = {
+        "mask_token_id": config_dict["mask_token_id"],
+        "target_layer_ids": aux_layer_ids,
+    }

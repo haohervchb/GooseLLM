@@ -655,6 +655,9 @@ __device__ __forceinline__ void ONLINE_SOFTMAX(
             float4 buffer = sS_float4[idx];
             thread_max = fmaxf(thread_max, fmaxf(fmaxf(buffer.x, buffer.y), fmaxf(buffer.z, buffer.w)));
         }
+        for (int idx = tail + thread; idx < VALID_KV; idx += THREADS_PER_ROW) {
+            thread_max = fmaxf(thread_max, sS_float[idx]);
+        }
     }
 
     // Phase 2: Warp reduction thread_max
@@ -683,14 +686,12 @@ __device__ __forceinline__ void ONLINE_SOFTMAX(
             half_buffer[rb_idx++] = __float22half2_rn(make_float2(e2, e3));
         }
 
-        if (tail < VALID_KV) {
-            #pragma unroll 4
-            for (int idx = tail + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
-                float v = (idx < VALID_KV) ? sS_float[idx] : NEG_INF;
-                float e = __expf(fmaxf(v - new_max, -80.0f));
-                thread_sum += (idx < VALID_KV) ? e : 0.0f;
-                sP_half[idx] = (idx < VALID_KV) ? __float2half_rn(e) : __float2half(0.f);
-            }
+        #pragma unroll 4
+        for (int idx = tail + thread; idx < BLOCK_N; idx += THREADS_PER_ROW) {
+            float v = (idx < VALID_KV) ? sS_float[idx] : NEG_INF;
+            float e = __expf(fmaxf(v - new_max, -80.0f));
+            thread_sum += (idx < VALID_KV) ? e : 0.0f;
+            sP_half[idx] = (idx < VALID_KV) ? __float2half_rn(e) : __float2half(0.f);
         }
 
         int wb_idx = 0;

@@ -81,9 +81,9 @@ class SpecDecodeBaseProposer:
             self.speculative_config.use_local_argmax_reduction
         )
         # The drafter can get longer sequences than the target model.
-        max_batch_size = vllm_config.scheduler_config.max_num_seqs
+        self.max_batch_size = vllm_config.scheduler_config.max_num_seqs
         self.max_num_tokens = (
-            vllm_config.scheduler_config.max_num_batched_tokens + max_batch_size
+            vllm_config.scheduler_config.max_num_batched_tokens + self.max_batch_size
         )
         self.token_arange_np = np.arange(self.max_num_tokens)
         # We need to get the hidden size from the draft model config because
@@ -155,7 +155,7 @@ class SpecDecodeBaseProposer:
 
         # We need +1 here because the arange is used to set query_start_loc,
         # which has one more element than batch_size.
-        max_num_slots_for_arange = max(max_batch_size + 1, self.max_num_tokens)
+        max_num_slots_for_arange = max(self.max_batch_size + 1, self.max_num_tokens)
         self.arange = torch.arange(
             max_num_slots_for_arange, device=device, dtype=torch.int32
         )
@@ -167,7 +167,7 @@ class SpecDecodeBaseProposer:
         )
 
         self.backup_next_token_ids = CpuGpuBuffer(
-            max_batch_size,
+            self.max_batch_size,
             dtype=torch.int32,
             pin_memory=is_pin_memory_available(),
             device=device,
@@ -234,7 +234,7 @@ class SpecDecodeBaseProposer:
         # Precompute draft position offsets in flattened tree.
         self.tree_draft_pos_offsets = torch.arange(
             1, len(self.tree_choices) + 1, device=device, dtype=torch.int32
-        ).repeat(max_batch_size, 1)
+        ).repeat(self.max_batch_size, 1)
 
     def _get_positions(self, num_tokens: int):
         if self.uses_mrope:
