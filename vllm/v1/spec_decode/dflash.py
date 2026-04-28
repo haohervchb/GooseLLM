@@ -16,6 +16,7 @@ from vllm.logger import init_logger
 from vllm.triton_utils import triton
 from vllm.v1.attention.backend import AttentionMetadataBuilder, CommonAttentionMetadata
 from vllm.v1.spec_decode.eagle import SpecDecodeBaseProposer
+from vllm.v1.worker.utils import bind_kv_cache
 from vllm.v1.spec_decode.utils import (
     PADDING_SLOT_ID,
     copy_and_expand_dflash_inputs_kernel,
@@ -85,6 +86,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
 
         # For DFlash we use the input embeddings to embed the mask token
         self.parallel_drafting_hidden_state_tensor = None
+        self._draft_kv_initialized = False
+        self._scratch_block_id = -1
 
     @override
     def _raise_if_multimodal(self):
@@ -128,6 +131,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # The upstream DFlash proposer never calls combine_hidden_states.
 
         # Run DFlash-specific input setup (non-causal attention)
+        if not self._draft_kv_initialized:
+            self._allocate_draft_kv_cache()
+
         num_query, token_indices_to_sample, common_attn_metadata = (
             self.set_inputs_first_pass(
                 target_token_ids=target_token_ids,
@@ -180,56 +186,6 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self._context_positions_buffer[:num_context],
             self._context_slot_mapping_buffer[:num_context],
         )
-
-        # DEBUG: verify KV cache binding and NaN for draft layers
-        for layer_name in self.attn_layer_names:
-            layer = self.runner.compilation_config.static_forward_context.get(
-                layer_name
-            )
-            if layer is None:
-                logger.warning("DFlash propose: layer %s not in forward context", layer_name)
-                continue
-            kv_cache = getattr(layer, "kv_cache", None)
-            if kv_cache is None:
-                logger.warning("DFlash propose: layer %s has no kv_cache", layer_name)
-            elif isinstance(kv_cache, list):
-                if len(kv_cache) == 0:
-                    logger.warning("DFlash propose: layer %s kv_cache is empty list", layer_name)
-                elif hasattr(kv_cache[0], "numel"):
-                    cache_tensor = kv_cache[0]
-                    logger.info(
-                        "DFlash propose: layer %s kv_cache shape=%s numel=%d",
-                        layer_name,
-                        cache_tensor.shape,
-                        cache_tensor.numel(),
-                    )
-                    if torch.isnan(cache_tensor).any():
-                        logger.warning("DFlash propose: layer %s KV cache has NaN", layer_name)
-                    if torch.isinf(cache_tensor).any():
-                        logger.warning("DFlash propose: layer %s KV cache has Inf", layer_name)
-                else:
-                    logger.warning(
-                        "DFlash propose: layer %s kv_cache[0] type=%s",
-                        layer_name,
-                        type(kv_cache[0]).__name__,
-                    )
-            elif hasattr(kv_cache, "numel"):
-                logger.info(
-                    "DFlash propose: layer %s kv_cache shape=%s numel=%d",
-                    layer_name,
-                    kv_cache.shape,
-                    kv_cache.numel(),
-                )
-                if torch.isnan(kv_cache).any():
-                    logger.warning("DFlash propose: layer %s KV cache has NaN", layer_name)
-                if torch.isinf(kv_cache).any():
-                    logger.warning("DFlash propose: layer %s KV cache has Inf", layer_name)
-            else:
-                logger.warning(
-                    "DFlash propose: layer %s kv_cache type=%s",
-                    layer_name,
-                    type(kv_cache).__name__,
-                )
 
         # Build model inputs
         input_ids = self.input_ids[:num_input_tokens]
@@ -301,6 +257,72 @@ class DFlashProposer(SpecDecodeBaseProposer):
         # draft_token_ids is [batch_size * num_speculative_tokens]
         return draft_token_ids.view(batch_size, self.num_speculative_tokens)
 
+    def _allocate_draft_kv_cache(self):
+        """Allocate and bind KV cache for the draft model's attention layers."""
+        if self._draft_kv_initialized:
+            return
+        
+        if self.runner is None or not hasattr(self.runner, "kv_caches") or not self.runner.kv_caches:
+            logger.warning("DFlash: target model KV cache not available for binding yet")
+            return
+
+        # Find target model's KV cache to get block info
+        target_kv_caches = self.runner.kv_caches
+        sample_cache = target_kv_caches[0]
+        # GooseLLM convention: kv_cache can be a list of tensors
+        if isinstance(sample_cache, list):
+            sample_cache = sample_cache[0]
+        
+        target_num_blocks = sample_cache.shape[0]
+        # CAP draft blocks to save memory (e.g. 2048 blocks = 32k tokens)
+        self.num_draft_blocks = min(target_num_blocks, 2048)
+        block_size = sample_cache.shape[2]
+        self._scratch_block_id = self.num_draft_blocks - 1
+        
+        logger.info("DFlash: allocating draft KV cache with %d blocks (capped from %d), block_size=%d", 
+                    self.num_draft_blocks, target_num_blocks, block_size)
+
+        # Map layers to their caches for binding
+        kv_caches_to_bind = {}
+        
+        # DFlashQwen3ForCausalLM has self.model (DFlashQwen3Model)
+        draft_model = self.model
+        if hasattr(draft_model, "model"):
+            draft_model = draft_model.model
+            
+        for layer in draft_model.layers:
+            # Each layer is a DFlashQwen3DecoderLayer
+            attn_layer = layer.self_attn
+            layer_name = attn_layer.layer_name
+            num_kv_heads = attn_layer.num_kv_heads
+            head_dim = attn_layer.head_dim
+            
+            # Shape: [num_blocks, 2, block_size, num_kv_heads, head_dim]
+            shape = (self.num_draft_blocks, 2, block_size, num_kv_heads, head_dim)
+            # Allocate (use zeros to avoid NaNs if uninitialized parts are read)
+            kv_cache = torch.zeros(shape, dtype=self.dtype, device=self.device)
+            kv_caches_to_bind[layer_name] = kv_cache
+
+        # Bind to draft model's attention layers
+        # forward_context here is just a dict to satisfy bind_kv_cache's signature
+        # as it expects objects with a .kv_cache attribute.
+        dummy_forward_context = {}
+        for layer in draft_model.layers:
+            dummy_forward_context[layer.self_attn.layer_name] = layer.self_attn.attn
+
+        # bind_kv_cache(kv_caches_dict, forward_context_dict, runner_kv_caches_list)
+        # We don't want to add them to the runner's list, so we pass a dummy list.
+        dummy_runner_list = []
+        bind_kv_cache(kv_caches_to_bind, dummy_forward_context, dummy_runner_list)
+        
+        # Also need to call _build_fused_kv_buffers on the model so it can
+        # find the newly bound kv_cache during precompute.
+        if hasattr(draft_model, "_build_fused_kv_buffers"):
+            draft_model._build_fused_kv_buffers()
+
+        self._draft_kv_initialized = True
+        logger.info("DFlash: draft KV cache allocated and bound successfully")
+
     def set_inputs_first_pass(
         self,
         target_token_ids: torch.Tensor,
@@ -330,6 +352,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
         num_blocks = triton.cdiv(max_tokens_per_req, BLOCK_SIZE)
         grid = (batch_size, num_blocks)
 
+        # Create a draft-specific block table by aliasing the target model's blocks
+        # to fit in the smaller draft KV cache.
+        draft_block_table = cad.block_table_tensor % self.num_draft_blocks
+
         has_num_rejected = num_rejected_tokens_gpu is not None
         copy_and_expand_dflash_inputs_kernel[grid](
             next_token_ids_ptr=next_token_ids,
@@ -340,12 +366,13 @@ class DFlashProposer(SpecDecodeBaseProposer):
             out_context_slot_mapping_ptr=self._context_slot_mapping_buffer,
             out_query_slot_mapping_ptr=self._slot_mapping_buffer,
             out_token_indices_ptr=token_indices_to_sample,
-            block_table_ptr=cad.block_table_tensor,
-            block_table_stride=cad.block_table_tensor.stride(0),
+            block_table_ptr=draft_block_table,
+            block_table_stride=draft_block_table.stride(0),
             query_start_loc_ptr=cad.query_start_loc,
             num_rejected_tokens_ptr=(
                 num_rejected_tokens_gpu if has_num_rejected else 0
             ),
+            scratch_block_id=self._scratch_block_id,
             parallel_drafting_token_id=self.parallel_drafting_token_id,
             block_size=self.block_size,
             num_query_per_req=num_query_per_req,
@@ -375,7 +402,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_actual_tokens=num_query_total,
             max_query_len=num_query_per_req,
             max_seq_len=cad.max_seq_len + num_query_per_req,
-            block_table_tensor=cad.block_table_tensor,
+            block_table_tensor=draft_block_table,
             slot_mapping=query_slot_mapping,
             causal=False,
         )

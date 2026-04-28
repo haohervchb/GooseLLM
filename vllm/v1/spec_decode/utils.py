@@ -135,6 +135,7 @@ def copy_and_expand_dflash_inputs_kernel(
     query_start_loc_ptr,  # [num_reqs + 1]
     num_rejected_tokens_ptr,  # [num_reqs] or null (0) when not padded
     # Scalars
+    scratch_block_id,  # tl.int32
     parallel_drafting_token_id,  # tl.int32
     block_size,  # tl.int32
     num_query_per_req,  # tl.int32
@@ -202,8 +203,11 @@ def copy_and_expand_dflash_inputs_kernel(
     block_id = tl.load(
         block_table_ptr + req_idx * block_table_stride + block_num,
         mask=in_bounds,
-        other=0,
+        other=-1,
     ).to(tl.int64)
+    # If block_id is -1, use the scratch_block_id
+    block_id = tl.where(block_id == -1, scratch_block_id, block_id)
+    
     slot = block_id * block_size + (positions % block_size)
     tl.store(out_context_slot_mapping_ptr + ctx_pos_out, slot, mask=is_ctx)
     tl.store(out_query_slot_mapping_ptr + query_out, slot, mask=is_query)
