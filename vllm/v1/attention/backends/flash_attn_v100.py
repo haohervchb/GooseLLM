@@ -356,13 +356,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         block_size = k_cache.shape[1]
         softmax_scale = self.scale
 
-        # Ensure KV cache write (do_kv_cache_update) completes before reading
+        # Barrier: ensure do_kv_cache_update completes before paged kernel reads
+        # from the KV cache. Without this, torch.compile may reorder the Triton
+        # reshape_and_cache write and the CUDA paged_fwd read, causing token 0
+        # to read stale/uninitialized cache data (produces NaN with block_size>16).
         torch.cuda.synchronize()
 
         # Call paged kernel with native GQA support.
         # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
         causal = getattr(attn_metadata, "causal", True)
-        result = self.flash_attn_paged(
+        _unused_out, softmax_lse = self.flash_attn_paged(
             query,
             k_cache,
             v_cache,
@@ -376,39 +379,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             causal=causal,
             num_kv_heads=num_heads_kv,
         )
-        _unused_out, softmax_lse = result
-
-        # Guard: if paged kernel produced NaN, fall back to Triton
-        if torch.isnan(output).any():
-            global _warned_prefill_fallback
-            n_nan = torch.isnan(output).sum().item()
-            n_total = output.numel()
-            if not _warned_prefill_fallback:
-                # Detailed diagnostics
-                nan_by_token = torch.isnan(output).any(dim=-1).any(dim=-1).cpu().tolist()
-                seq_lens_list = seq_lens.tolist()
-                query_lens = (query_start_loc[1:] - query_start_loc[:-1]).tolist()
-                logger.warning(
-                    "FLASH_ATTN_V100 paged prefill NaN: %d/%d values "
-                    "num_heads=%d num_kv_heads=%d head_dim=%d "
-                    "seq_lens=%s query_lens=%s block_size=%d nan_tokens=%s. "
-                    "Falling back to Triton.",
-                    n_nan, n_total,
-                    num_heads_q, num_heads_kv, head_dim,
-                    seq_lens_list, query_lens, block_size,
-                    str(nan_by_token)[:120],
-                )
-                _warned_prefill_fallback = True
-            return TritonAttentionImpl.forward(
-                self,
-                layer,
-                query,
-                key,
-                value,
-                kv_cache,
-                attn_metadata,
-                output,
-            )
 
         return output
 
