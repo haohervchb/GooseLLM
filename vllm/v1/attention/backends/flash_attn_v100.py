@@ -356,6 +356,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         block_size = k_cache.shape[1]
         softmax_scale = self.scale
 
+        # Ensure KV cache write (do_kv_cache_update) completes before reading
+        torch.cuda.synchronize()
+
         # Call paged kernel with native GQA support.
         # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
         causal = getattr(attn_metadata, "causal", True)
