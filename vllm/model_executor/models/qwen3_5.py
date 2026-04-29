@@ -570,10 +570,14 @@ class Qwen3_5Model(Qwen3NextModel):
                         tp_rank = get_tp_group().rank_in_group
                         try:
                             if "w13_weight" in _mapped_name:
-                                # Checkpoint: [E*2*I_full, H] → [E, 2*I_full, H]
-                                # Param: [E, 2*I_per_rank, H] with gate/up interleaved
                                 E = param.shape[0]
-                                I_full_2 = loaded_weight.shape[0] // E  # 2 * I_full
+                                I_full_2 = loaded_weight.shape[0] // E
+                                if I_full_2 < 2:
+                                    logger.warning(
+                                        "Skipping %s: loaded_shape=%s param_shape=%s E=%d I_full_2=%d",
+                                        _mapped_name, tuple(loaded_weight.shape),
+                                        tuple(param.shape), E, I_full_2)
+                                    continue
                                 I_full = I_full_2 // 2
                                 w13_full = loaded_weight.view(E, I_full_2, -1)
                                 I_per_rank = param.shape[1] // 2
@@ -587,9 +591,14 @@ class Qwen3_5Model(Qwen3NextModel):
                                 loaded[:, 1::2, :] = up.to(param.device)
                                 param.data.copy_(loaded)
                             else:
-                                # Checkpoint: [E*I_full, H] → Param: [E, H, I_per_rank]
                                 E = param.shape[0]
                                 I_full = loaded_weight.shape[0] // E
+                                if I_full < 1:
+                                    logger.warning(
+                                        "Skipping %s: loaded_shape=%s param_shape=%s E=%d I_full=%d",
+                                        _mapped_name, tuple(loaded_weight.shape),
+                                        tuple(param.shape), E, I_full)
+                                    continue
                                 w2_full = loaded_weight.view(E, I_full, -1)
                                 I_per_rank = param.shape[2]
                                 w2_shard = w2_full.narrow(
