@@ -568,43 +568,43 @@ class Qwen3_5Model(Qwen3NextModel):
                         param = params_dict[_mapped_name]
                         from vllm.distributed.parallel_state import get_tp_group
                         tp_rank = get_tp_group().rank_in_group
-                        tp_world = get_tp_group().world_size
-                        if "w13_weight" in _mapped_name:
-                            # Checkpoint: [E*2*I_full, H] → [E, 2*I_full, H]
-                            # Param: [E, 2*I_per_rank, H] with gate/up interleaved
-                            E = param.shape[0]
-                            I_full_2 = loaded_weight.shape[0] // E  # 2 * I_full
-                            I_full = I_full_2 // 2
-                            w13_full = loaded_weight.view(E, I_full_2, -1)
-                            # Split gate (first half) and up (second half)
-                            # TP-shard each: take the tp_rank slice
-                            I_per_rank = param.shape[1] // 2
-                            gate = w13_full[:, :I_full, :].narrow(
-                                1, I_per_rank * tp_rank, I_per_rank
-                            )  # [E, I_per_rank, H]
-                            up = w13_full[:, I_full:, :].narrow(
-                                1, I_per_rank * tp_rank, I_per_rank
-                            )  # [E, I_per_rank, H]
-                            # Interleave: per-expert [gate, up] → [E, 2*I_per_rank, H]
-                            loaded = torch.empty(param.shape, dtype=param.dtype, device=param.device)
-                            loaded[:, 0::2, :] = gate.to(param.device)
-                            loaded[:, 1::2, :] = up.to(param.device)
-                            param.data.copy_(loaded)
-                        else:
-                            # Checkpoint: [E*I_full, H] → [E, I_full, H]
-                            # Param: [E, H, I_per_rank]
-                            E = param.shape[0]
-                            I_full = loaded_weight.shape[0] // E
-                            w2_full = loaded_weight.view(E, I_full, -1)
-                            # TP-shard: take tp_rank slice of intermediate
-                            I_per_rank = param.shape[2]
-                            w2_shard = w2_full.narrow(
-                                1, I_per_rank * tp_rank, I_per_rank
-                            )  # [E, I_per_rank, H]
-                            w2_shard = w2_shard.transpose(1, 2).contiguous()  # [E, H, I_per_rank]
-                            param.data.copy_(w2_shard)
-                        loaded_params.add(_mapped_name)
-                        continue
+                        try:
+                            if "w13_weight" in _mapped_name:
+                                # Checkpoint: [E*2*I_full, H] → [E, 2*I_full, H]
+                                # Param: [E, 2*I_per_rank, H] with gate/up interleaved
+                                E = param.shape[0]
+                                I_full_2 = loaded_weight.shape[0] // E  # 2 * I_full
+                                I_full = I_full_2 // 2
+                                w13_full = loaded_weight.view(E, I_full_2, -1)
+                                I_per_rank = param.shape[1] // 2
+                                gate = w13_full[:, :I_full, :].narrow(
+                                    1, I_per_rank * tp_rank, I_per_rank)
+                                up = w13_full[:, I_full:, :].narrow(
+                                    1, I_per_rank * tp_rank, I_per_rank)
+                                loaded = torch.empty(param.shape, dtype=param.dtype,
+                                                     device=param.device)
+                                loaded[:, 0::2, :] = gate.to(param.device)
+                                loaded[:, 1::2, :] = up.to(param.device)
+                                param.data.copy_(loaded)
+                            else:
+                                # Checkpoint: [E*I_full, H] → Param: [E, H, I_per_rank]
+                                E = param.shape[0]
+                                I_full = loaded_weight.shape[0] // E
+                                w2_full = loaded_weight.view(E, I_full, -1)
+                                I_per_rank = param.shape[2]
+                                w2_shard = w2_full.narrow(
+                                    1, I_per_rank * tp_rank, I_per_rank)
+                                w2_shard = w2_shard.transpose(1, 2).contiguous()
+                                param.data.copy_(w2_shard)
+                            loaded_params.add(_mapped_name)
+                            continue
+                        except Exception:
+                            logger.warning(
+                                "Failed to load fused MoE weight %s loaded=%s param=%s",
+                                _mapped_name, tuple(loaded_weight.shape),
+                                tuple(param.shape), exc_info=True,
+                            )
+                            raise
 
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
