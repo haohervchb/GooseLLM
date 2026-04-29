@@ -358,7 +358,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # Call paged kernel with native GQA support.
         # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
         causal = getattr(attn_metadata, "causal", True)
-        _unused_out, softmax_lse = self.flash_attn_paged(
+        result = self.flash_attn_paged(
             query,
             k_cache,
             v_cache,
@@ -372,6 +372,30 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             causal=causal,
             num_kv_heads=num_heads_kv,
         )
+        _unused_out, softmax_lse = result
+
+        # Guard: if paged kernel produced NaN, fall back to Triton
+        if torch.isnan(output).any():
+            global _warned_prefill_fallback
+            if not _warned_prefill_fallback:
+                logger.warning(
+                    "FLASH_ATTN_V100 paged prefill produced NaN! "
+                    "num_tokens=%d num_heads=%d num_kv_heads=%d head_dim=%d "
+                    "seq_lens=%s block_size=%d. Falling back to Triton.",
+                    num_actual_tokens, num_heads_q, num_heads_kv, head_dim,
+                    seq_lens.tolist(), block_size,
+                )
+                _warned_prefill_fallback = True
+            return TritonAttentionImpl.forward(
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
 
         return output
 
