@@ -380,6 +380,29 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             num_kv_heads=num_heads_kv,
         )
 
+        # Safety net: if paged kernel still produces NaN, fall back to Triton
+        if torch.isnan(output).any():
+            global _warned_prefill_fallback
+            if not _warned_prefill_fallback:
+                logger.warning(
+                    "FLASH_ATTN_V100 paged prefill produced NaN "
+                    "(num_heads=%d num_kv_heads=%d head_dim=%d seq_lens=%s "
+                    "block_size=%d). Falling back to Triton.",
+                    num_heads_q, num_heads_kv, head_dim,
+                    seq_lens.tolist(), block_size,
+                )
+                _warned_prefill_fallback = True
+            return TritonAttentionImpl.forward(
+                self,
+                layer,
+                query,
+                key,
+                value,
+                kv_cache,
+                attn_metadata,
+                output,
+            )
+
         return output
 
 
