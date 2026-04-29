@@ -622,12 +622,13 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        # DEBUG: NaN in GDN inputs
-        if (
-            torch.isnan(mixed_qkv).any()
-            or torch.isnan(b).any()
-            or torch.isnan(a).any()
-        ):
+        # DEBUG: NaN in GDN inputs (skip during CUDA graph capture)
+        if not torch.cuda.is_current_stream_capturing():
+            if (
+                torch.isnan(mixed_qkv).any()
+                or torch.isnan(b).any()
+                or torch.isnan(a).any()
+            ):
             import logging
             _logger = logging.getLogger(__name__)
             _logger.warning(
@@ -724,8 +725,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
             ).transpose(0, 1)
-            # DEBUG: NaN after conv1d
-            if torch.isnan(mixed_qkv_non_spec).any():
+            # DEBUG: NaN after conv1d (skip during CUDA graph capture)
+            if not torch.cuda.is_current_stream_capturing():
+                if torch.isnan(mixed_qkv_non_spec).any():
                 import logging
                 _logger = logging.getLogger(__name__)
                 _logger.warning(
@@ -754,8 +756,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
 
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
 
-        # DEBUG: NaN after gating
-        if torch.isnan(g).any() or torch.isinf(g).any():
+        # DEBUG: NaN after gating (skip during CUDA graph capture)
+        if not torch.cuda.is_current_stream_capturing():
+            if torch.isnan(g).any() or torch.isinf(g).any():
             import logging
             _logger = logging.getLogger(__name__)
             _logger.warning(
@@ -821,8 +824,9 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            # DEBUG: NaN after chunk prefill
-            if torch.isnan(core_attn_out_non_spec).any():
+            # DEBUG: NaN after chunk prefill (skip during CUDA graph capture)
+            if not torch.cuda.is_current_stream_capturing():
+                if torch.isnan(core_attn_out_non_spec).any():
                 import logging
                 _logger = logging.getLogger(__name__)
                 _logger.warning(
