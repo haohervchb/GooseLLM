@@ -558,9 +558,9 @@ class Qwen3_5Model(Qwen3NextModel):
                 break
             else:
                 # Handle FP16 MoE expert fused weights (2D checkpoint → 3D model param)
-                # Checkpoint: experts.gate_up_proj [E*2*I, H] → model: experts.w13_weight [E, 2*I, H/TP]
-                # Checkpoint: experts.down_proj [E*I, H] → model: experts.w2_weight [E, H, I/TP]
-                # Only for non-quantized weights (AWQ uses different names/loaders)
+                # Checkpoint: experts.gate_up_proj [E*2*I, H] → model: experts.w13_weight [E, 2*I, H]
+                # Checkpoint: experts.down_proj [E*I, H] → model: experts.w2_weight [E, H, I]
+                # Weights are replicated across TP ranks (not sharded), so load full tensor.
                 _mapped_name = None
                 if loaded_weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
                     if "experts.gate_up_proj" in name:
@@ -569,30 +569,13 @@ class Qwen3_5Model(Qwen3NextModel):
                         _mapped_name = name.replace("experts.down_proj", "experts.w2_weight")
                     if _mapped_name is not None and _mapped_name in params_dict:
                         param = params_dict[_mapped_name]
-                        # Reshape 2D checkpoint [E*2*I, H] or [E*I, H] into 3D model format
-                        param_shape = param.shape  # [E, 2*I, H/TP] or [E, H, I/TP]
-                        from vllm.distributed.parallel_state import get_tp_group
-                        tp_world = get_tp_group().world_size
-                        tp_rank = get_tp_group().rank_in_group
-                        if tp_world > 1:
-                            # Un-shard: multiply hidden dim by tp_world to get full checkpoint dim
-                            if "w13_weight" in _mapped_name:
-                                # gate_up_proj: ColumnParallel on hidden (dim 2)
-                                full_hidden = param_shape[2] * tp_world
-                                loaded_weight = loaded_weight.view(param_shape[0], param_shape[1], full_hidden)
-                                loaded_weight = loaded_weight.narrow(2, param_shape[2] * tp_rank, param_shape[2]).contiguous()
-                            else:
-                                # down_proj: RowParallel on intermediate (dim 2)
-                                full_inter = param_shape[2] * tp_world
-                                loaded_weight = loaded_weight.view(param_shape[0], full_inter, param_shape[1])
-                                loaded_weight = loaded_weight.transpose(1, 2).contiguous()
-                                loaded_weight = loaded_weight.narrow(2, param_shape[2] * tp_rank, param_shape[2]).contiguous()
+                        if "w13_weight" in _mapped_name:
+                            loaded_weight = loaded_weight.view(param.shape).contiguous()
                         else:
-                            if "w13_weight" in _mapped_name:
-                                loaded_weight = loaded_weight.view(param_shape).contiguous()
-                            else:
-                                loaded_weight = loaded_weight.view(param_shape[0], param_shape[2], param_shape[1])
-                                loaded_weight = loaded_weight.transpose(1, 2).contiguous()
+                            # w2: checkpoint [E*I, H] → [E, I, H] → transpose → [E, H, I]
+                            loaded_weight = loaded_weight.view(
+                                param.shape[0], param.shape[2], param.shape[1]
+                            ).transpose(1, 2).contiguous()
                         param.data.copy_(loaded_weight)
                         loaded_params.add(_mapped_name)
                         continue
