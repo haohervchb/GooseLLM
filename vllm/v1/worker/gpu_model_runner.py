@@ -4118,8 +4118,6 @@ class GPUModelRunner(
         elif spec_config.use_dflash():
             # DFlash uses a separate path since it generates all draft tokens
             # in parallel with non-causal attention, unlike sequential EAGLE.
-            from vllm.v1.spec_decode.dflash import DFlashProposer
-
             assert isinstance(sampled_token_ids, torch.Tensor)
             assert isinstance(self.drafter, DFlashProposer)
 
