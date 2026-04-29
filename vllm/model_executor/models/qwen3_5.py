@@ -557,63 +557,48 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Handle FP16 MoE expert fused weights (2D checkpoint → 3D model param)
-                _mapped_name = None
+                # Handle FP16 fused MoE expert weights: split into per-expert tensors
+                # and load through existing weight_loader (handles TP sharding correctly)
                 if loaded_weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
                     if "experts.gate_up_proj" in name:
-                        _mapped_name = name.replace("experts.gate_up_proj", "experts.w13_weight")
+                        # Fused [E*2*I, H] → per-expert [2*I, H] with gate(w1)+up(w3)
+                        E = loaded_weight.shape[0] // (2 * self.config.moe_intermediate_size)
+                        w = loaded_weight.view(E, -1, loaded_weight.shape[-1])
+                        for e in range(E):
+                            for shard_id, start in [("w1", 0), ("w3", 1)]:
+                                i_start = start * self.config.moe_intermediate_size
+                                i_end = i_start + self.config.moe_intermediate_size
+                                expert_w = w[e, i_start:i_end, :]
+                                for mapping in expert_params_mapping:
+                                    pn, wn, expert_id, sid = mapping
+                                    if expert_id == e and shard_id == sid and shard_id[0] in wn:
+                                        if pn in name:
+                                            continue
+                                        new_name = name.replace("experts.gate_up_proj", pn)
+                                        if new_name in params_dict:
+                                            param = params_dict[new_name]
+                                            param.weight_loader(
+                                                param, expert_w, new_name, shard_id, expert_id)
+                                            break
+                        loaded_params.add(name)
+                        continue
                     elif "experts.down_proj" in name:
-                        _mapped_name = name.replace("experts.down_proj", "experts.w2_weight")
-                    if _mapped_name is not None and _mapped_name in params_dict:
-                        param = params_dict[_mapped_name]
-                        from vllm.distributed.parallel_state import get_tp_group
-                        tp_rank = get_tp_group().rank_in_group
-                        try:
-                            if "w13_weight" in _mapped_name:
-                                E = param.shape[0]
-                                I_full_2 = loaded_weight.shape[0] // E
-                                if I_full_2 < 2:
-                                    logger.warning(
-                                        "Skipping %s: loaded_shape=%s param_shape=%s E=%d I_full_2=%d",
-                                        _mapped_name, tuple(loaded_weight.shape),
-                                        tuple(param.shape), E, I_full_2)
-                                    continue
-                                I_full = I_full_2 // 2
-                                w13_full = loaded_weight.view(E, I_full_2, -1)
-                                I_per_rank = param.shape[1] // 2
-                                gate = w13_full[:, :I_full, :].narrow(
-                                    1, I_per_rank * tp_rank, I_per_rank)
-                                up = w13_full[:, I_full:, :].narrow(
-                                    1, I_per_rank * tp_rank, I_per_rank)
-                                loaded = torch.empty(param.shape, dtype=param.dtype,
-                                                     device=param.device)
-                                loaded[:, 0::2, :] = gate.to(param.device)
-                                loaded[:, 1::2, :] = up.to(param.device)
-                                param.data.copy_(loaded)
-                            else:
-                                E = param.shape[0]
-                                I_full = loaded_weight.shape[0] // E
-                                if I_full < 1:
-                                    logger.warning(
-                                        "Skipping %s: loaded_shape=%s param_shape=%s E=%d I_full=%d",
-                                        _mapped_name, tuple(loaded_weight.shape),
-                                        tuple(param.shape), E, I_full)
-                                    continue
-                                w2_full = loaded_weight.view(E, I_full, -1)
-                                I_per_rank = param.shape[2]
-                                w2_shard = w2_full.narrow(
-                                    1, I_per_rank * tp_rank, I_per_rank)
-                                w2_shard = w2_shard.transpose(1, 2).contiguous()
-                                param.data.copy_(w2_shard)
-                            loaded_params.add(_mapped_name)
-                            continue
-                        except Exception:
-                            logger.warning(
-                                "Failed to load fused MoE weight %s loaded=%s param=%s",
-                                _mapped_name, tuple(loaded_weight.shape),
-                                tuple(param.shape), exc_info=True,
-                            )
-                            raise
+                        # Fused [E*I, H] → per-expert [I, H] with down(w2)
+                        E = loaded_weight.shape[0] // self.config.moe_intermediate_size
+                        w = loaded_weight.view(E, -1, loaded_weight.shape[-1])
+                        for e in range(E):
+                            expert_w = w[e]
+                            for mapping in expert_params_mapping:
+                                pn, wn, expert_id, sid = mapping
+                                if expert_id == e and sid == "w2" and "down" in wn:
+                                    new_name = name.replace("experts.down_proj", pn)
+                                    if new_name in params_dict:
+                                        param = params_dict[new_name]
+                                        param.weight_loader(
+                                            param, expert_w, new_name, sid, expert_id)
+                                        break
+                        loaded_params.add(name)
+                        continue
 
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
