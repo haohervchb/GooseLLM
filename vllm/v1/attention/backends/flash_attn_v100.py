@@ -285,7 +285,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 )
                 _logged_prefill_flash = True
             return self._flash_v100_paged_prefill(
-                query, key, value, kv_cache, attn_metadata, output
+                layer, query, key, value, kv_cache, attn_metadata, output
             )
 
         if not _warned_decode_fallback:
@@ -307,6 +307,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def _flash_v100_paged_prefill(
         self,
+        layer: torch.nn.Module,
         query: torch.Tensor,
         key: torch.Tensor,
         value: torch.Tensor,
