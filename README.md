@@ -24,36 +24,36 @@ docker build \
 conda create -n goosellm python=3.12 -y
 conda activate goosellm
 
-# 2. Install dependencies
+# 2. Install PyTorch (CUDA 12.8)
 python -m pip install --upgrade pip setuptools wheel
 python -m pip install torch torchvision torchaudio \
     --index-url https://download.pytorch.org/whl/cu128
+
+# 3. Install dependencies
 python -m pip install -r requirements/cuda.txt
 python -m pip install 'setuptools>=77.0.3,<81.0.0' 'setuptools_scm>=8' grpcio-tools cmake build
 
-# 3. Set build environment
+# 4. Set build environment
 export CUDA_HOME=/usr/local/cuda-12.8
 export PATH=$CUDA_HOME/bin:$PATH
 export LD_LIBRARY_PATH=$CUDA_HOME/lib64:${LD_LIBRARY_PATH:-}
 export VLLM_TARGET_DEVICE=cuda
 export VLLM_MAIN_CUDA_VERSION=12.8
 export TORCH_CUDA_ARCH_LIST=7.0
-export MAX_JOBS=$(nproc)
 export NVCC_THREADS=4
+# NOTE: do NOT set MAX_JOBS — the build system auto-detects optimal parallelism
 
-# 4. Build SM70 kernel
-cd csrc/flash_attention_v100
-sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_available():/' setup.py
-python setup.py build_ext --inplace
-cd ../..
+# 5. Build and install (editable, one command)
+pip install -e .
 
-# 5. Build vLLM wheel (matches 1Cat's original process)
-rm -rf build vllm.egg-info .deps/*-build .deps/*-subbuild
-SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
-  python -m build --wheel --no-isolation --outdir dist-cu128-sm70
+# 6. Verify kernel correctness
+python csrc/flash_attention_v100/test_paged_prefill.py
+```
 
-# 6. Install
-python -m pip install dist-cu128-sm70/*.whl --no-deps
+The SM70 FlashAttention kernel is built automatically during `pip install -e .`.
+If it fails (e.g., CUDA toolkit missing), build it manually:
+```bash
+cd csrc/flash_attention_v100 && python setup.py build_ext --inplace
 ```
 
 ## Example Serving Commands
