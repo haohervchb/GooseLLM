@@ -557,6 +557,32 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
+                # Handle FP16 MoE expert fused weights
+                # Checkpoint: experts.gate_up_proj / experts.down_proj (all experts fused)
+                # Model: experts.w13_weight / experts.w2_weight (fused, TP-sharded)
+                # Only for non-quantized weights (AWQ uses different names/loaders)
+                _mapped_name = None
+                if loaded_weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
+                    if "experts.gate_up_proj" in name:
+                        _mapped_name = name.replace("experts.gate_up_proj", "experts.w13_weight")
+                    elif "experts.down_proj" in name:
+                        _mapped_name = name.replace("experts.down_proj", "experts.w2_weight")
+                    if _mapped_name is not None and _mapped_name in params_dict:
+                        param = params_dict[_mapped_name]
+                        # ColumnParallel sharding on dim 1 (hidden_size)
+                        from vllm.distributed.parallel_state import get_tp_group
+                        tp_world = get_tp_group().world_size
+                        if tp_world > 1:
+                            shard_dim = 1
+                            shard_size = param.shape[shard_dim]
+                            tp_rank = get_tp_group().rank_in_group
+                            loaded_weight = loaded_weight.narrow(
+                                shard_dim, shard_size * tp_rank, shard_size
+                            ).contiguous()
+                        param.data.copy_(loaded_weight)
+                        loaded_params.add(_mapped_name)
+                        continue
+
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
