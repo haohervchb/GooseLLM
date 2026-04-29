@@ -622,23 +622,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         b = b[:num_actual_tokens]
         a = a[:num_actual_tokens]
 
-        # DEBUG: NaN in GDN inputs (skip during CUDA graph capture)
-        if not torch.cuda.is_current_stream_capturing():
-            if (
-                torch.isnan(mixed_qkv).any()
-                or torch.isnan(b).any()
-                or torch.isnan(a).any()
-            ):
-            import logging
-            _logger = logging.getLogger(__name__)
-            _logger.warning(
-                "GDN layer %s: NaN in inputs (mixed_qkv=%s b=%s a=%s)",
-                self.prefix,
-                torch.isnan(mixed_qkv).any().item(),
-                torch.isnan(b).any().item(),
-                torch.isnan(a).any().item(),
-            )
-
         # 1. Convolution sequence transformation
         conv_weights = self.conv1d.weight.view(
             self.conv1d.weight.size(0), self.conv1d.weight.size(2)
@@ -725,15 +708,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 query_start_loc=non_spec_query_start_loc,
                 metadata=attn_metadata,
             ).transpose(0, 1)
-            # DEBUG: NaN after conv1d (skip during CUDA graph capture)
-            if not torch.cuda.is_current_stream_capturing():
-                if torch.isnan(mixed_qkv_non_spec).any():
-                import logging
-                _logger = logging.getLogger(__name__)
-                _logger.warning(
-                    "GDN layer %s: NaN after causal_conv1d_fn (num_prefills=%d)",
-                    self.prefix, attn_metadata.num_prefills,
-                )
         elif attn_metadata.num_decodes > 0:
             mixed_qkv_non_spec = causal_conv1d_update(
                 mixed_qkv_non_spec,
@@ -755,18 +729,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
         )
 
         g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
-
-        # DEBUG: NaN after gating (skip during CUDA graph capture)
-        if not torch.cuda.is_current_stream_capturing():
-            if torch.isnan(g).any() or torch.isinf(g).any():
-            import logging
-            _logger = logging.getLogger(__name__)
-            _logger.warning(
-                "GDN layer %s: NaN/Inf in gates g=%s beta=%s",
-                self.prefix,
-                torch.isnan(g).any().item(),
-                torch.isnan(beta).any().item(),
-            )
 
         if spec_sequence_masks is not None:
             if attn_metadata.num_prefills == 0 and attn_metadata.num_decodes == 0:
@@ -824,15 +786,6 @@ class Qwen3NextGatedDeltaNet(nn.Module, MambaBase):
                 head_first=False,
                 use_qk_l2norm_in_kernel=True,
             )
-            # DEBUG: NaN after chunk prefill (skip during CUDA graph capture)
-            if not torch.cuda.is_current_stream_capturing():
-                if torch.isnan(core_attn_out_non_spec).any():
-                import logging
-                _logger = logging.getLogger(__name__)
-                _logger.warning(
-                    "GDN layer %s: NaN after chunk_gated_delta_rule (shape=%s)",
-                    self.prefix, core_attn_out_non_spec.shape,
-                )
             # Init cache
             ssm_state[non_spec_state_indices_tensor] = last_recurrent_state.to(
                 ssm_state.dtype
@@ -1189,8 +1142,7 @@ class Qwen3NextModel(nn.Module):
             hidden_states = intermediate_tensors["hidden_states"]
             residual = intermediate_tensors["residual"]
 
-        for idx, layer in enumerate(islice(self.layers, self.start_layer, self.end_layer)):
-            layer_idx = self.start_layer + idx
+        for layer in islice(self.layers, self.start_layer, self.end_layer):
             hidden_states, residual = layer(
                 positions=positions,
                 hidden_states=hidden_states,

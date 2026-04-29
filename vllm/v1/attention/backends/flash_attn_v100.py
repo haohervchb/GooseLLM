@@ -370,17 +370,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             block_size=block_size,
             softmax_scale=softmax_scale,
             causal=causal,
-            num_kv_heads=num_kv_heads,
+            num_kv_heads=num_heads_kv,
         )
-
-        # DEBUG: NaN after paged prefill (skip during CUDA graph capture)
-        if not torch.cuda.is_current_stream_capturing():
-            if torch.isnan(output).any():
-                logger.warning(
-                    "FLASH_ATTN_V100 paged prefill: NaN in output "
-                    "(num_actual_tokens=%d, num_heads=%d, head_dim=%d)",
-                    num_actual_tokens, num_heads_q, head_dim,
-                )
 
         return output
 
