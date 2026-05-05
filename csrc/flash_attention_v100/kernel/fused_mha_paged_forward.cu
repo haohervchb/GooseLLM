@@ -139,6 +139,25 @@ flash_attention_paged_forward_kernel(
     float*  sMax = _s.row_max;
     float*  sSum = _s.row_sum;
 
+    // ---- SMEM block table cache ----
+    // Available SMEM after main layout: 96KB - TOTAL_SMEM
+    constexpr size_t SMEM_LAYOUT_BYTES = Config::TOTAL_SMEM;
+    constexpr size_t MAX_AVAILABLE_SMEM = 98304;  // 96 KB per SM on V100
+    constexpr size_t bt_cache_bytes = (MAX_AVAILABLE_SMEM > SMEM_LAYOUT_BYTES)
+        ? MAX_AVAILABLE_SMEM - SMEM_LAYOUT_BYTES : 0;
+    constexpr int bt_cache_size = static_cast<int>(bt_cache_bytes / sizeof(int));
+    const int bt_cached = min(max_blocks_per_seq, bt_cache_size);
+
+    // Place block table cache right after the main SmemLayout
+    int* __restrict__ bt_smem = reinterpret_cast<int*>(
+        smem_raw + SMEM_LAYOUT_BYTES);
+
+    // Copy block table into SMEM (all threads participate)
+    for (int i = tid; i < bt_cached; i += TPB) {
+        bt_smem[i] = bt[i];
+    }
+    __syncthreads();
+
     // Row stride for Q/output vs KV cache (native GQA)
     const uint64_t q_row_stride  = static_cast<uint64_t>(num_heads)    * D * 2;
     const uint64_t kv_row_stride = static_cast<uint64_t>(num_kv_heads) * D * 2;
@@ -165,37 +184,26 @@ flash_attention_paged_forward_kernel(
 
     // ---- Load Q tile from flat 3D buffer for this head ----
     {
-        int q_u4_per_row = (D + 7) >> 3;
+        const int q_u4_per_row = (D + 7) >> 3;
         const int q_total = valid_q * q_u4_per_row;
-        uint32_t q_dst = static_cast<uint32_t>(__cvta_generic_to_shared(sQ));
-        
+        const uint4* q_vec = reinterpret_cast<const uint4*>(
+            reinterpret_cast<const char*>(q_base_addr));
+        uint4* sQ_vec = reinterpret_cast<uint4*>(sQ);
+
         for (int i = tid; i < q_total; i += TPB) {
             const int r = i / q_u4_per_row;
             const int c = i % q_u4_per_row;
             const int abs_r = global_q_start + r;
-            
+
             if (abs_r >= global_q_start + valid_q) {
-                uint32_t d = q_dst + static_cast<uint32_t>(r * D_STRIDE_U4 + c) * 16;
-                asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                             :: "r"(d) : "memory");
+                sQ_vec[r * D_STRIDE_U4 + c] = make_uint4(0, 0, 0, 0);
                 continue;
             }
-            
-            uint64_t src = q_base_addr 
-                         + static_cast<uint64_t>(abs_r) * q_row_stride
-                         + q_head_offset
-                         + static_cast<uint64_t>(c) * 16;
-            
-            uint32_t d = q_dst + static_cast<uint32_t>(r * D_STRIDE_U4 + c) * 16;
-            
-            uint32_t r0, r1, r2, r3;
-            __asm__ volatile(
-                "{\n  .reg .pred p;\n"
-                "  ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                "  st.shared.v4.u32 [%5], {%0,%1,%2,%3};\n"
-                "}\n"
-                : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                : "l"(src), "r"(d) : "memory");
+
+            const uint64_t src_idx = static_cast<uint64_t>(abs_r) * (q_row_stride >> 4)
+                                   + (q_head_offset >> 4)
+                                   + static_cast<uint64_t>(c);
+            sQ_vec[r * D_STRIDE_U4 + c] = __ldg(&q_vec[src_idx]);
         }
     }
 
@@ -220,56 +228,42 @@ flash_attention_paged_forward_kernel(
         {
             constexpr int k_u4 = D_STRIDE_U4;
             const int k_total = kv_valid * k_u4;
-            uint32_t k_dst = static_cast<uint32_t>(__cvta_generic_to_shared(sK));
-            if (k_total == 0) {
-                __syncthreads();
-                continue;
-            }
+            if (k_total == 0) { __syncthreads(); continue; }
+
+            const uint4* k_cache_vec = reinterpret_cast<const uint4*>(
+                reinterpret_cast<const char*>(k_cache_addr));
+            uint4* sK_vec = reinterpret_cast<uint4*>(sK);
 
             for (int i = tid; i < k_total; i += TPB) {
                 const int tok = i / k_u4;
                 const int u4c = i % k_u4;
-
                 int pos = kv_start + tok;
+
                 if (pos >= seq_len) {
-                    uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                                 :: "r"(d) : "memory");
+                    sK_vec[tok * k_u4 + u4c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
 
                 int blk = pos / block_size;
                 int off = pos % block_size;
                 if (blk >= max_blocks_per_seq) {
-                    uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                                 :: "r"(d) : "memory");
+                    sK_vec[tok * k_u4 + u4c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
 
-                int phys = bt[blk];
+                int phys = (blk < bt_cached) ? bt_smem[blk] : bt[blk];
                 if (phys < 0) {
-                    uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                                 :: "r"(d) : "memory");
+                    sK_vec[tok * k_u4 + u4c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
 
-                uint64_t src = k_cache_addr
-                             + static_cast<uint64_t>(phys) * block_size * kv_row_stride
-                             + static_cast<uint64_t>(off) * kv_row_stride
-                             + kv_head_offset
-                             + static_cast<uint64_t>(u4c) * 16;
+                const uint64_t src_idx =
+                    static_cast<uint64_t>(phys) * block_size * (kv_row_stride >> 4)
+                    + static_cast<uint64_t>(off) * (kv_row_stride >> 4)
+                    + (kv_head_offset >> 4)
+                    + static_cast<uint64_t>(u4c);
 
-                uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-
-                uint32_t r0, r1, r2, r3;
-                __asm__ volatile(
-                    "{\n  ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                    "  st.shared.v4.u32 [%5], {%0,%1,%2,%3};\n"
-                    "}\n"
-                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                    : "l"(src), "r"(d) : "memory");
+                sK_vec[tok * k_u4 + u4c] = __ldg(&k_cache_vec[src_idx]);
             }
         }
 
@@ -301,56 +295,42 @@ flash_attention_paged_forward_kernel(
         {
             constexpr int v_u4 = D_STRIDE_U4;
             const int v_total = kv_valid * v_u4;
-            uint32_t v_dst = static_cast<uint32_t>(__cvta_generic_to_shared(sV));
-            if (v_total == 0) {
-                __syncthreads();
-                continue;
-            }
+            if (v_total == 0) { __syncthreads(); continue; }
+
+            const uint4* v_cache_vec = reinterpret_cast<const uint4*>(
+                reinterpret_cast<const char*>(v_cache_addr));
+            uint4* sV_vec = reinterpret_cast<uint4*>(sV);
 
             for (int i = tid; i < v_total; i += TPB) {
                 const int tok = i / v_u4;
                 const int u4c = i % v_u4;
-
                 int pos = kv_start + tok;
+
                 if (pos >= seq_len) {
-                    uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                                 :: "r"(d) : "memory");
+                    sV_vec[tok * v_u4 + u4c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
 
                 int blk = pos / block_size;
                 int off = pos % block_size;
                 if (blk >= max_blocks_per_seq) {
-                    uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                                 :: "r"(d) : "memory");
+                    sV_vec[tok * v_u4 + u4c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
 
-                int phys = bt[blk];
+                int phys = (blk < bt_cached) ? bt_smem[blk] : bt[blk];
                 if (phys < 0) {
-                    uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};"
-                                 :: "r"(d) : "memory");
+                    sV_vec[tok * v_u4 + u4c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
 
-                uint64_t src = v_cache_addr
-                             + static_cast<uint64_t>(phys) * block_size * kv_row_stride
-                             + static_cast<uint64_t>(off) * kv_row_stride
-                             + kv_head_offset
-                             + static_cast<uint64_t>(u4c) * 16;
+                const uint64_t src_idx =
+                    static_cast<uint64_t>(phys) * block_size * (kv_row_stride >> 4)
+                    + static_cast<uint64_t>(off) * (kv_row_stride >> 4)
+                    + (kv_head_offset >> 4)
+                    + static_cast<uint64_t>(u4c);
 
-                uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-
-                uint32_t r0, r1, r2, r3;
-                __asm__ volatile(
-                    "{\n  ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                    "  st.shared.v4.u32 [%5], {%0,%1,%2,%3};\n"
-                    "}\n"
-                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                    : "l"(src), "r"(d) : "memory");
+                sV_vec[tok * v_u4 + u4c] = __ldg(&v_cache_vec[src_idx]);
             }
         }
 
@@ -493,6 +473,22 @@ flash_attention_paged_forward_kernel_gqa_shared_kv(
     float*  sMax = _s.row_max;
     float*  sSum = _s.row_sum;
 
+    // ---- SMEM block table cache ----
+    constexpr size_t SMEM_LAYOUT_BYTES_GQA = KernelConfig<D>::TOTAL_SMEM;
+    constexpr size_t MAX_AVAILABLE_SMEM_GQA = 98304;
+    constexpr size_t bt_cache_bytes_gqa = (MAX_AVAILABLE_SMEM_GQA > SMEM_LAYOUT_BYTES_GQA)
+        ? MAX_AVAILABLE_SMEM_GQA - SMEM_LAYOUT_BYTES_GQA : 0;
+    constexpr int bt_cache_size_gqa = static_cast<int>(bt_cache_bytes_gqa / sizeof(int));
+    const int bt_cached_gqa = min(max_blocks_per_seq, bt_cache_size_gqa);
+
+    int* __restrict__ bt_smem = reinterpret_cast<int*>(
+        smem_raw + SMEM_LAYOUT_BYTES_GQA);
+
+    for (int i = tid; i < bt_cached_gqa; i += TPB) {
+        bt_smem[i] = bt[i];
+    }
+    __syncthreads();
+
     const uint64_t q_row_stride  = static_cast<uint64_t>(num_heads)    * D * 2;
     const uint64_t kv_row_stride = static_cast<uint64_t>(num_kv_heads) * D * 2;
 
@@ -517,31 +513,25 @@ flash_attention_paged_forward_kernel_gqa_shared_kv(
 
         // Load Q tile for this Q-head
         {
-            int q_u4_per_row = (D + 7) >> 3;
+            const int q_u4_per_row = (D + 7) >> 3;
             const int q_total = valid_q * q_u4_per_row;
-            uint32_t q_dst = static_cast<uint32_t>(__cvta_generic_to_shared(sQ));
+            const uint4* q_vec = reinterpret_cast<const uint4*>(
+                reinterpret_cast<const char*>(q_base_addr));
+            uint4* sQ_vec = reinterpret_cast<uint4*>(sQ);
+
             for (int i = tid; i < q_total; i += TPB) {
                 const int r = i / q_u4_per_row;
                 const int c = i % q_u4_per_row;
                 const int abs_r = global_q_start + r;
                 if (abs_r >= global_q_start + valid_q) {
-                    uint32_t d = q_dst + static_cast<uint32_t>(r * D_STRIDE_U4 + c) * 16;
-                    asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                    sQ_vec[r * D_STRIDE_U4 + c] = make_uint4(0, 0, 0, 0);
                     continue;
                 }
-                uint64_t src = q_base_addr
-                             + static_cast<uint64_t>(abs_r) * q_row_stride
-                             + q_head_offset_bytes
-                             + static_cast<uint64_t>(c) * 16;
-                uint32_t d = q_dst + static_cast<uint32_t>(r * D_STRIDE_U4 + c) * 16;
-                uint32_t r0, r1, r2, r3;
-                __asm__ volatile(
-                    "{\n  .reg .pred p;\n"
-                    "  ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                    "  st.shared.v4.u32 [%5], {%0,%1,%2,%3};\n"
-                    "}\n"
-                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                    : "l"(src), "r"(d) : "memory");
+                const uint64_t src_idx =
+                    static_cast<uint64_t>(abs_r) * (q_row_stride >> 4)
+                    + (q_head_offset_bytes >> 4)
+                    + static_cast<uint64_t>(c);
+                sQ_vec[r * D_STRIDE_U4 + c] = __ldg(&q_vec[src_idx]);
             }
         }
         __syncthreads();
@@ -563,43 +553,37 @@ flash_attention_paged_forward_kernel_gqa_shared_kv(
             {
                 constexpr int k_u4 = D_STRIDE_U4;
                 const int k_total = kv_valid * k_u4;
-                uint32_t k_dst = static_cast<uint32_t>(__cvta_generic_to_shared(sK));
                 if (k_total == 0) { __syncthreads(); continue; }
+
+                const uint4* k_cache_vec = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const char*>(k_cache_addr));
+                uint4* sK_vec = reinterpret_cast<uint4*>(sK);
+
                 for (int i = tid; i < k_total; i += TPB) {
                     const int tok = i / k_u4;
                     const int u4c = i % k_u4;
                     int pos = kv_start + tok;
                     if (pos >= seq_len) {
-                        uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                        asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                        sK_vec[tok * k_u4 + u4c] = make_uint4(0, 0, 0, 0);
                         continue;
                     }
                     int blk = pos / block_size;
                     int off = pos % block_size;
                     if (blk >= max_blocks_per_seq) {
-                        uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                        asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                        sK_vec[tok * k_u4 + u4c] = make_uint4(0, 0, 0, 0);
                         continue;
                     }
-                    int phys = bt[blk];
+                    int phys = (blk < bt_cached_gqa) ? bt_smem[blk] : bt[blk];
                     if (phys < 0) {
-                        uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                        asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                        sK_vec[tok * k_u4 + u4c] = make_uint4(0, 0, 0, 0);
                         continue;
                     }
-                    uint64_t src = k_cache_addr
-                                 + static_cast<uint64_t>(phys) * block_size * kv_row_stride
-                                 + static_cast<uint64_t>(off) * kv_row_stride
-                                 + kv_head_offset
-                                 + static_cast<uint64_t>(u4c) * 16;
-                    uint32_t d = k_dst + static_cast<uint32_t>(tok * k_u4 + u4c) * 16;
-                    uint32_t r0, r1, r2, r3;
-                    __asm__ volatile(
-                        "{\n  ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                        "  st.shared.v4.u32 [%5], {%0,%1,%2,%3};\n"
-                        "}\n"
-                        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                        : "l"(src), "r"(d) : "memory");
+                    const uint64_t src_idx =
+                        static_cast<uint64_t>(phys) * block_size * (kv_row_stride >> 4)
+                        + static_cast<uint64_t>(off) * (kv_row_stride >> 4)
+                        + (kv_head_offset >> 4)
+                        + static_cast<uint64_t>(u4c);
+                    sK_vec[tok * k_u4 + u4c] = __ldg(&k_cache_vec[src_idx]);
                 }
             }
             __syncthreads();
@@ -628,43 +612,37 @@ flash_attention_paged_forward_kernel_gqa_shared_kv(
             {
                 constexpr int v_u4 = D_STRIDE_U4;
                 const int v_total = kv_valid * v_u4;
-                uint32_t v_dst = static_cast<uint32_t>(__cvta_generic_to_shared(sV));
                 if (v_total == 0) { __syncthreads(); continue; }
+
+                const uint4* v_cache_vec = reinterpret_cast<const uint4*>(
+                    reinterpret_cast<const char*>(v_cache_addr));
+                uint4* sV_vec = reinterpret_cast<uint4*>(sV);
+
                 for (int i = tid; i < v_total; i += TPB) {
                     const int tok = i / v_u4;
                     const int u4c = i % v_u4;
                     int pos = kv_start + tok;
                     if (pos >= seq_len) {
-                        uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                        asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                        sV_vec[tok * v_u4 + u4c] = make_uint4(0, 0, 0, 0);
                         continue;
                     }
                     int blk = pos / block_size;
                     int off = pos % block_size;
                     if (blk >= max_blocks_per_seq) {
-                        uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                        asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                        sV_vec[tok * v_u4 + u4c] = make_uint4(0, 0, 0, 0);
                         continue;
                     }
-                    int phys = bt[blk];
+                    int phys = (blk < bt_cached_gqa) ? bt_smem[blk] : bt[blk];
                     if (phys < 0) {
-                        uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                        asm volatile("st.shared.v4.u32 [%0], {0,0,0,0};" :: "r"(d) : "memory");
+                        sV_vec[tok * v_u4 + u4c] = make_uint4(0, 0, 0, 0);
                         continue;
                     }
-                    uint64_t src = v_cache_addr
-                                 + static_cast<uint64_t>(phys) * block_size * kv_row_stride
-                                 + static_cast<uint64_t>(off) * kv_row_stride
-                                 + kv_head_offset
-                                 + static_cast<uint64_t>(u4c) * 16;
-                    uint32_t d = v_dst + static_cast<uint32_t>(tok * v_u4 + u4c) * 16;
-                    uint32_t r0, r1, r2, r3;
-                    __asm__ volatile(
-                        "{\n  ld.global.v4.u32 {%0,%1,%2,%3}, [%4];\n"
-                        "  st.shared.v4.u32 [%5], {%0,%1,%2,%3};\n"
-                        "}\n"
-                        : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                        : "l"(src), "r"(d) : "memory");
+                    const uint64_t src_idx =
+                        static_cast<uint64_t>(phys) * block_size * (kv_row_stride >> 4)
+                        + static_cast<uint64_t>(off) * (kv_row_stride >> 4)
+                        + (kv_head_offset >> 4)
+                        + static_cast<uint64_t>(u4c);
+                    sV_vec[tok * v_u4 + u4c] = __ldg(&v_cache_vec[src_idx]);
                 }
             }
             __syncthreads();

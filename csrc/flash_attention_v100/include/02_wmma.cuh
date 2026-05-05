@@ -26,7 +26,8 @@ __device__ __forceinline__ void WMMA_GEMM_INIT_SMEM(char* smem_raw) {
 
 // ======================================================================================
 // TILE LOADER UINT4 (Universal: Single or Dual load, with internal casting)
-// Loads uint4-vectorized tiles from global memory to shared memory with bounds checking.
+// Loads uint4-vectorized tiles from global memory to shared memory via __ldg()
+// (read-only data cache) for lower latency on broadcast read-once data.
 // ======================================================================================
 template<bool DUAL_LOAD, int SRC_STRIDE, int DST_STRIDE>
 __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
@@ -41,92 +42,38 @@ __device__ __forceinline__ void WMMA_GEMM_LOAD_TILE(
     constexpr int src_stride_uint4 = (SRC_STRIDE + 7) >> 3;
     constexpr int dst_stride_uint4 = (DST_STRIDE + 7) >> 3;
 
-    const int total_iters   = VALID_ROWS * src_stride_uint4;
+    const int total_iters = VALID_ROWS * src_stride_uint4;
 
     if (total_iters == 0) return;
 
-    uint64_t src_base0 = static_cast<uint64_t>(__cvta_generic_to_global(SRC0));
-    uint32_t dst_base0 = static_cast<uint32_t>(__cvta_generic_to_shared(DST0));
-
-    uint64_t src_base1 = 0;
-    uint32_t dst_base1 = 0;
-    if constexpr (DUAL_LOAD) {
-        src_base1 = static_cast<uint64_t>(__cvta_generic_to_global(SRC1));
-        dst_base1 = static_cast<uint32_t>(__cvta_generic_to_shared(DST1));
-    }
+    const uint4* __restrict__ src0_vec = reinterpret_cast<const uint4*>(SRC0);
+    uint4* __restrict__ dst0_vec = reinterpret_cast<uint4*>(DST0);
 
     #pragma unroll 2
     for (int idx = THREAD_ID; idx < total_iters; idx += THREADS_TOTAL) {
         const int row = idx / src_stride_uint4;
         const int col = idx % src_stride_uint4;
 
-        const int src_offset = row * src_stride_uint4 + col;
-        const int dst_offset = row * dst_stride_uint4 + col;
+        const int src_idx = row * src_stride_uint4 + col;
+        const int dst_idx = row * dst_stride_uint4 + col;
 
         const bool in_bounds = (row < VALID_ROWS);
-        const int pred = in_bounds ? 1 : 0;
 
+        uint4 val0 = make_uint4(0, 0, 0, 0);
         if (in_bounds) {
-            uint64_t src_addr0 = src_base0 + (static_cast<uint64_t>(src_offset) << 4);
-            uint32_t dst_addr0 = dst_base0 + (static_cast<uint32_t>(dst_offset) << 4);
+            val0 = __ldg(&src0_vec[src_idx]);
+        }
+        dst0_vec[dst_idx] = val0;
 
-            if constexpr (DUAL_LOAD) {
-                uint64_t src_addr1 = src_base1 + (static_cast<uint64_t>(src_offset) << 4);
-                uint32_t dst_addr1 = dst_base1 + (static_cast<uint32_t>(dst_offset) << 4);
+        if constexpr (DUAL_LOAD) {
+            const uint4* __restrict__ src1_vec = reinterpret_cast<const uint4*>(SRC1);
+            uint4* __restrict__ dst1_vec = reinterpret_cast<uint4*>(DST1);
 
-                uint32_t r0, r1, r2, r3;
-                asm volatile(
-                    "{\n"
-                    "  .reg .pred p;\n"
-                    "  setp.ne.b32 p, %8, 0;\n"
-                    "  mov.u32 %0, 0;\n"
-                    "  mov.u32 %1, 0;\n"
-                    "  mov.u32 %2, 0;\n"
-                    "  mov.u32 %3, 0;\n"
-                    "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-                    "  @p st.shared.v4.u32 [%6], {%0, %1, %2, %3};\n"
-                    "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%5];\n"
-                    "  @p st.shared.v4.u32 [%7], {%0, %1, %2, %3};\n"
-                    "}\n"
-                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                    : "l"(src_addr0), "l"(src_addr1),
-                      "r"(dst_addr0), "r"(dst_addr1),
-                    "r"(pred)
-                    : "memory"
-                );
-            } else {
-                uint32_t r0, r1, r2, r3;
-                asm volatile(
-                    "{\n"
-                    "  .reg .pred p;\n"
-                    "  setp.ne.b32 p, %6, 0;\n"
-                    "  mov.u32 %0, 0;\n"
-                    "  mov.u32 %1, 0;\n"
-                    "  mov.u32 %2, 0;\n"
-                    "  mov.u32 %3, 0;\n"
-                    "  @p ld.global.v4.u32 {%0, %1, %2, %3}, [%4];\n"
-                    "  @p st.shared.v4.u32 [%5], {%0, %1, %2, %3};\n"
-                    "}\n"
-                    : "=r"(r0), "=r"(r1), "=r"(r2), "=r"(r3)
-                    : "l"(src_addr0), "r"(dst_addr0), "r"(pred)
-                    : "memory"
-                );
+            uint4 val1 = make_uint4(0, 0, 0, 0);
+            if (in_bounds) {
+                val1 = __ldg(&src1_vec[src_idx]);
             }
-        } else {
-            uint32_t dst_addr0 = dst_base0 + (static_cast<uint32_t>(dst_offset) << 4);
-            if constexpr (DUAL_LOAD) {
-                uint32_t dst_addr1 = dst_base1 + (static_cast<uint32_t>(dst_offset) << 4);
-                asm volatile(
-                    "st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};\n\t"
-                    "st.shared.v4.u32 [%1], {0x0, 0x0, 0x0, 0x0};"
-                    : : "r"(dst_addr0), "r"(dst_addr1) : "memory"
-                );
-            } else {
-                asm volatile(
-                    "st.shared.v4.u32 [%0], {0x0, 0x0, 0x0, 0x0};"
-                    : : "r"(dst_addr0) : "memory"
-                );
-            }
+            dst1_vec[dst_idx] = val1;
         }
     }
 }

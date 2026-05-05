@@ -46,6 +46,7 @@ def get_ext_modules():
                 "kernel/fused_mha_forward.cu",
                 "kernel/fused_mha_backward.cu",
                 "kernel/fused_mha_paged_forward.cu",
+                "kernel/fused_mha_decode.cu",
             ],
             include_dirs=[this_dir / "include"],
             extra_compile_args={

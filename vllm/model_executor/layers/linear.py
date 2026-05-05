@@ -91,6 +91,9 @@ def _maybe_sm70_dense_forward(
     x: torch.Tensor,
     bias: torch.Tensor | None,
 ) -> torch.Tensor | None:
+    if getattr(layer, "_sm70_f16_forbidden", False):
+        return None
+
     if not getattr(layer, "_sm70_f16_prepared", False):
         return None
 
@@ -110,9 +113,10 @@ def _maybe_sm70_dense_forward(
     x_2d = x.reshape(-1, x.shape[-1])
     if not x_2d.is_contiguous():
         x_2d = x_2d.contiguous()
+    use_graph_safe_raw_op = torch.compiler.is_compiling()
     tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
     k_ld = getattr(layer, "_sm70_f16_k_ld", None)
-    if tm_weight is not None and k_ld is not None:
+    if not use_graph_safe_raw_op and tm_weight is not None and k_ld is not None:
         out = torch.empty(
             (x_2d.size(0), tm_weight.shape[0]),
             dtype=x_2d.dtype,
@@ -299,10 +303,21 @@ class UnquantizedLinearMethod(LinearMethodBase):
         if not current_platform.is_cuda_alike():
             return
 
-        if not SM70_F16_DENSE_ENABLED:
+        force_enable = getattr(layer, "_sm70_f16_force_enable", False)
+
+        if not SM70_F16_DENSE_ENABLED and not force_enable:
             return
 
-        if not is_layer_sm70_f16_dense(getattr(layer, "prefix", "")):
+        if getattr(layer, "_sm70_f16_forbidden", False):
+            return
+
+        if (
+            not force_enable
+            and not is_layer_sm70_f16_dense(getattr(layer, "prefix", ""))
+        ):
+            return
+
+        if hasattr(layer, "input_is_parallel") and not layer.input_is_parallel:
             return
 
         if not hasattr(torch.ops._C, "sm70_f16_prepare"):

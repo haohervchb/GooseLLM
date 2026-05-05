@@ -105,7 +105,8 @@ class FlashAttnFunc(torch.autograd.Function):
             raise NotImplementedError("softcap != 0.0 not supported")
 
         if q_.shape[1] != k_.shape[1]:
-            raise ValueError(f"n_heads mismatch: q has {q_.shape[1]}, k has {k_.shape[1]} (MQA/GQA not supported)")
+            # GQA: different Q/KV head counts now supported
+            pass
 
         window_size_left, window_size_right = window_size
         if causal and (window_size_left != -1 or window_size_right != -1):
