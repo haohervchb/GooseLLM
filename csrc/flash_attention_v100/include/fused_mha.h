@@ -128,4 +128,38 @@ std::vector<at::Tensor> flash_attention_paged_forward(
     bool is_causal
 );
 
+/**
+ * Flash Attention Decode Paged Forward
+ *
+ * Partition-based flash decode for single-token inference. Splits long KV
+ * sequences into partitions, computes local softmax per partition, then
+ * merges with global softmax rescaling. Optimized for V100 SM70 latency.
+ *
+ * @param q                   Query tensor [B, H, D] (fp16, single-token decode)
+ * @param k_cache             Key cache [num_blocks, block_size, num_kv_heads, D] (fp16)
+ * @param v_cache             Value cache [num_blocks, block_size, num_kv_heads, D] (fp16)
+ * @param out_                Optional output tensor [B, H, D] (fp16, output)
+ * @param block_table         Block table [B, max_num_blocks] (int32)
+ * @param seq_lens            Sequence lengths [B] (int32)
+ * @param tmp_out             Workspace for per-partition outputs [B_cap, H, P, D] (fp16)
+ * @param max_logits          Workspace for per-partition max logits [B_cap, H, P] (fp32)
+ * @param exp_sums            Workspace for per-partition exp sums [B_cap, H, P] (fp32)
+ * @param softmax_scale       Softmax scale (typically 1/sqrt(D))
+ * @param partition_size      Tokens per partition (256, 512, or 1024)
+ * @return                    Output tensor [B, H, D]
+ */
+at::Tensor flash_attention_decode_paged(
+    const at::Tensor& q,
+    const at::Tensor& k_cache,
+    const at::Tensor& v_cache,
+    std::optional<at::Tensor>& out_,
+    const at::Tensor& block_table,
+    const at::Tensor& seq_lens,
+    at::Tensor& tmp_out,
+    at::Tensor& max_logits,
+    at::Tensor& exp_sums,
+    const float softmax_scale,
+    const int partition_size
+);
+
 #endif // FUSED_MHA_H

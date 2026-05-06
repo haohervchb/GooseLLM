@@ -17,5 +17,7 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
     m.def("bwd", &flash_attention_backward, "FlashAttention-2 Backward Pass (Volta)");
     m.def("paged_fwd", &flash_attention_paged_forward, 
           "FlashAttention-2 Paged Forward Pass (Volta) — supports block-table KV cache");
+    m.def("decode_fwd", &flash_attention_decode_paged,
+          "FlashAttention-2 Decode Paged Forward (Volta) — partition-based single-token decode");
 }
 

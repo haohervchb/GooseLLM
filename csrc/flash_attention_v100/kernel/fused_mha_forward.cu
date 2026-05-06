@@ -27,9 +27,11 @@ flash_attention_forward_kernel(
            float* __restrict__ softmax_lse,
     const int B,
     const int H,
+    const int H_KV,
     const int M,
     const int N,
-    const float softmax_scale
+    const float softmax_scale,
+    const int causal_q_offset  // Q start position within KV sequence (0 = pure prefill)
 ) {
     using Config = KernelConfig<D>;
     constexpr int BLOCK_M           = Config::BLOCK_M;
@@ -43,6 +45,14 @@ flash_attention_forward_kernel(
     // head index (batch * num_heads + head)
     const int batch_head_id = blockIdx.z;
     if (batch_head_id >= B * H) return;
+
+    const int batch_id     = batch_head_id / H;
+    const int head_id      = batch_head_id % H;
+
+    // GQA: map Q head to KV head
+    const int kv_group_size = H / H_KV;
+    const int kv_head_id    = head_id / kv_group_size;
+    const size_t kv_linear  = (size_t)batch_id * H_KV + kv_head_id;
 
     const int block_idx = blockIdx.x;
     const int start_q = block_idx * BLOCK_M;
@@ -73,11 +83,11 @@ flash_attention_forward_kernel(
     const int lane_id = tid & 31;
 
     // ==================================================================================
-    // Layout: [B, H, M/N, D] linear offset: batch_head_id * (M/N) * D + start_* * D
+    // Layout: Q uses batch_head_id, K/V use kv_head mapping for GQA
     // ==================================================================================
     const __half* __restrict__ q_ptr           = Q +           (size_t)batch_head_id * M * D + start_q * D;
-    const __half* __restrict__ k_ptr           = K +           (size_t)batch_head_id * N * D;
-    const __half* __restrict__ v_ptr           = V +           (size_t)batch_head_id * N * D;
+    const __half* __restrict__ k_ptr           = K +           kv_linear * N * D;
+    const __half* __restrict__ v_ptr           = V +           kv_linear * N * D;
           __half* __restrict__ out_ptr         = Out +         (size_t)batch_head_id * M * D + start_q * D;
            float* __restrict__ softmax_lse_ptr = softmax_lse + (size_t)batch_head_id * M + start_q;
 
@@ -126,8 +136,10 @@ flash_attention_forward_kernel(
         if (start_kv >= N) break;
         const int valid_kv_rows = min(BLOCK_N, N - start_kv);
 
-        // Early skip per tile
-        if constexpr (IS_CAUSAL) { if (start_kv >= start_q + valid_q_rows) continue; }
+        // Early skip per tile with causal Q offset
+        if constexpr (IS_CAUSAL) {
+            if (start_kv >= start_q + causal_q_offset + valid_q_rows) continue;
+        }
 
         // ==================================================================================
         // Load:     K tile from global to sK(reuse) shared memory
@@ -150,7 +162,7 @@ flash_attention_forward_kernel(
         WMMA_GEMM_SCORES<GemmType::sQ_KT, D, IS_CAUSAL, BLOCK_M, BLOCK_N, D_STRIDE, N_STRIDE, WARPS_PER_BLOCK>(
         sQ, sK, sS,
         valid_q_rows, valid_kv_rows,
-        start_q,      start_kv,
+        start_q + causal_q_offset, start_kv,
         softmax_scale,
         warp_id,      lane_id);
 
@@ -232,8 +244,10 @@ void launcher_flash_attention_forward(
 
     const int B = Q.size(0);
     const int H = Q.size(1);
+    const int H_KV = K.size(1);   // GQA: KV heads may differ from Q heads
     const int M = Q.size(2);
     const int N = K.size(2);
+    const int causal_q_offset = is_causal ? max(0, N - M) : 0;
 
     const int grid_x = (M + Config::BLOCK_M - 1) / Config::BLOCK_M;
     const dim3 grid(grid_x, 1, B * H);
@@ -255,7 +269,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(V.data_ptr()),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            B, H, M, N, softmax_scale
+            B, H, H_KV, M, N, softmax_scale, causal_q_offset
         );
     } else {
         flash_attention_forward_kernel<D, false><<<grid, block, smem, stream>>>(
@@ -264,7 +278,7 @@ void launcher_flash_attention_forward(
             reinterpret_cast<const __half*>(V.data_ptr()),
             reinterpret_cast<__half*>(Out.data_ptr()),
             softmax_lse.data_ptr<float>(),
-            B, H, M, N, softmax_scale
+            B, H, H_KV, M, N, softmax_scale, causal_q_offset
         );
     }
 }

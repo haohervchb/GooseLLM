@@ -34,11 +34,13 @@ logger = init_logger(__name__)
 # Lazy imports: only resolve optional CUDA extensions when needed.
 _flash_attn_func = None
 _flash_attn_paged = None
+_flash_attn_decode = None
 _warned_prefill_fallback = False
 _warned_feature_fallback = False
 _warned_decode_fallback = False
 _warned_missing_flash_ops = False
 _logged_prefill_flash = False
+_logged_decode_flash = False
 
 
 def _iter_flash_attn_v100_roots():
@@ -97,15 +99,22 @@ def _import_flash_attn_v100_module():
 
 def _get_flash_ops():
     """Lazy-load flash_attn_v100 ops if available."""
-    global _flash_attn_func, _flash_attn_paged
-    flash_attn_v100_mod = _import_flash_attn_v100_module()
-    if flash_attn_v100_mod is not None:
+    global _flash_attn_func, _flash_attn_paged, _flash_attn_decode
+    mod = _import_flash_attn_v100_module()
+    if mod is not None:
         if _flash_attn_func is None:
-            _flash_attn_func = getattr(flash_attn_v100_mod, "flash_attn_func", None)
+            _flash_attn_func = getattr(mod, "flash_attn_func", None)
         if _flash_attn_paged is None:
             _flash_attn_paged = getattr(
-                flash_attn_v100_mod, "flash_attn_paged_forward", None
+                mod, "flash_attn_paged_forward", None
             )
+    # decode_fwd lives directly on the C extension module, not the Python wrapper
+    if _flash_attn_decode is None:
+        try:
+            import flash_attn_v100_cuda
+            _flash_attn_decode = getattr(flash_attn_v100_cuda, "decode_fwd", None)
+        except ImportError:
+            pass
     return _flash_attn_func, _flash_attn_paged
 
 
@@ -129,9 +138,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.flash_attn_func, self.flash_attn_paged = _get_flash_ops()
+        self.flash_attn_decode = _flash_attn_decode
         self.use_flash_v100 = self.flash_attn_func is not None
         self.use_flash_paged = self.flash_attn_paged is not None
+        self.use_flash_decode = self.flash_attn_decode is not None
         self._flash_attn_paged_ready = False
+        # Persistent decode workspace (lazily allocated)
+        self._decode_workspace = None
 
     def _ensure_paged_ready(self):
         """Validate paged kernel is ready (head dim, device, etc.)."""
@@ -155,6 +168,121 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # handles one head independently, so any positive num_heads works.
         self._flash_attn_paged_ready = True
         return True
+
+    def _supports_flash_decode_path(self) -> bool:
+        """Check whether flash decode kernel can run for the current config."""
+        return (
+            self.use_flash_decode
+            and self.attn_type == AttentionType.DECODER
+            and self.alibi_slopes is None
+            and self.logits_soft_cap == 0
+            and self.sinks is None
+            and self.sliding_window == (-1, -1)
+            and not self.kv_cache_dtype.startswith("fp8")
+            and self.head_size in (64, 80, 96, 112, 128, 256)
+        )
+
+    def _ensure_decode_workspace(self, batch_size: int, max_partitions: int):
+        """Allocate or resize persistent decode workspace tensors."""
+        if self._decode_workspace is not None:
+            ws_batch, _, ws_parts, ws_d = self._decode_workspace["tmp_out"].shape
+            if ws_batch >= batch_size and ws_parts >= max_partitions:
+                return
+        device = "cuda"
+        self._decode_workspace = {
+            "tmp_out": torch.empty(
+                batch_size, self.num_heads, max_partitions, self.head_size,
+                dtype=torch.float16, device=device,
+            ),
+            "max_logits": torch.empty(
+                batch_size, self.num_heads, max_partitions,
+                dtype=torch.float32, device=device,
+            ),
+            "exp_sums": torch.empty(
+                batch_size, self.num_heads, max_partitions,
+                dtype=torch.float32, device=device,
+            ),
+        }
+
+    def _flash_v100_decode(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Decode path using Flash V100 partition-based decode kernel."""
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        if num_actual_tokens == 0 or kv_cache.numel() == 0:
+            return output
+
+        key_cache, value_cache = kv_cache.unbind(1)
+
+        block_table = attn_metadata.block_table
+        seq_lens = attn_metadata.seq_lens
+        max_seq_len = int(seq_lens.max().item())
+
+        if max_seq_len <= 0:
+            return output
+
+        # For decode, each sequence has exactly 1 query token
+        batch_size = seq_lens.shape[0]
+
+        # Select partition size based on sequence length
+        if max_seq_len <= 256:
+            partition_size = 256
+        elif max_seq_len <= 4096:
+            partition_size = 512
+        else:
+            partition_size = 1024
+
+        max_partitions = (max_seq_len + partition_size - 1) // partition_size
+
+        self._ensure_decode_workspace(batch_size, max_partitions)
+        ws = self._decode_workspace
+
+        batch_q = query[:num_actual_tokens].view(
+            batch_size, self.num_heads, self.head_size
+        ).contiguous()
+
+        tmp_out = ws["tmp_out"][:batch_size, :, :max_partitions, :].contiguous()
+        max_logits = ws["max_logits"][:batch_size, :, :max_partitions].contiguous()
+        exp_sums = ws["exp_sums"][:batch_size, :, :max_partitions].contiguous()
+
+        out_batch = torch.empty_like(batch_q)
+
+        try:
+            self.flash_attn_decode(
+                batch_q, key_cache.contiguous(), value_cache.contiguous(),
+                out_batch, block_table, seq_lens,
+                tmp_out, max_logits, exp_sums,
+                self.scale, partition_size,
+            )
+        except Exception as exc:
+            logger.warning_once(
+                "FLASH_ATTN_V100 decode kernel fallback to Triton: %s", exc
+            )
+            return TritonAttentionImpl.forward(
+                self, layer, query, key, value, kv_cache,
+                attn_metadata, output,
+            )
+
+        output[:num_actual_tokens].copy_(out_batch.view(-1, self.num_heads, self.head_size))
+
+        # NaN safety net
+        if torch.isnan(output).any():
+            logger.warning_once(
+                "FLASH_ATTN_V100 decode kernel produced NaN, falling back to Triton."
+            )
+            return TritonAttentionImpl.forward(
+                self, layer, query, key, value, kv_cache,
+                attn_metadata, output,
+            )
+
+        return output
 
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
@@ -285,6 +413,18 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 )
                 _logged_prefill_flash = True
             return self._flash_v100_paged_prefill(
+                layer, query, key, value, kv_cache, attn_metadata, output
+            )
+
+        # Decode path — try Flash V100 decode kernel first, fall back to Triton
+        if self._supports_flash_decode_path() and not is_capturing:
+            global _logged_decode_flash
+            if not _logged_decode_flash:
+                logger.info(
+                    "FLASH_ATTN_V100 decode path: using partition-based CUDA kernel."
+                )
+                _logged_decode_flash = True
+            return self._flash_v100_decode(
                 layer, query, key, value, kv_cache, attn_metadata, output
             )
 
