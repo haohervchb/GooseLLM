@@ -268,6 +268,22 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor _gate_weight) -> ()");
   ops.impl("sm70_f16_gate_mul_out", torch::kCUDA, &sm70_f16_gate_mul_out);
 
+  // FP16 MoE TurboMind (SM70) — independent of AWQ path
+  ops.def(
+      "sm70_f16_moe_build_strided_ptrs(Tensor tm_weights, "
+      "int k_ld, int num_experts) -> Tensor[]");
+  ops.impl(
+      "sm70_f16_moe_build_strided_ptrs", torch::kCUDA,
+      &sm70_f16_moe_build_strided_ptrs);
+
+  ops.def(
+      "sm70_f16_moe_gemm_sm70_out(Tensor(a!) out, Tensor _in_feats, "
+      "Tensor expert_offsets, Tensor strided_ptrs_w, "
+      "int num_experts, int k, int n, bool gated_silu) -> ()");
+  ops.impl(
+      "sm70_f16_moe_gemm_sm70_out", torch::kCUDA,
+      &sm70_f16_moe_gemm_sm70_out);
+
   ops.def("sm70_gemm_import_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_import_cache", torch::kCUDA, &sm70_gemm_import_cache);
 

@@ -386,7 +386,8 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
         "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_4.cu"
         "${LMDEPLOY_ROOT}/src/turbomind/kernels/gemm/kernel/sm70_884_16.cu"
         "csrc/quantization/awq/tm_registry_sm70.cu"
-        "csrc/quantization/awq/awq_sm70_gemm.cu")
+        "csrc/quantization/awq/awq_sm70_gemm.cu"
+        "csrc/quantization/sm70_fp16_moe_gemm.cu")
 
       set_gencode_flags_for_srcs(
         SRCS "${AWQ_SM70_TURBOMIND_SRCS}"

@@ -581,7 +581,21 @@ class FusedMoE(CustomOp):
             if self.quant_config is not None:
                 quant_method = self.quant_config.get_quant_method(self, prefix)
             if quant_method is None:
-                quant_method = UnquantizedFusedMoEMethod(self.moe_config)
+                # SM70 FP16 MoE: use TurboMind s884h GEMM on V100
+                from vllm.platforms import current_platform
+                cap = current_platform.get_device_capability()
+                is_sm70 = (
+                    current_platform.is_cuda_alike()
+                    and cap is not None
+                    and cap.major == 7
+                )
+                if is_sm70:
+                    from vllm.model_executor.layers.fused_moe.sm70_fp16_moe import (
+                        SM70FP16MoEMethod,
+                    )
+                    quant_method = SM70FP16MoEMethod(self.moe_config)
+                else:
+                    quant_method = UnquantizedFusedMoEMethod(self.moe_config)
             assert isinstance(quant_method, FusedMoEMethodBase)
             return quant_method
 

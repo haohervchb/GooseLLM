@@ -234,6 +234,22 @@ void sm70_f16_gate_mul_out(torch::Tensor out,
                            torch::Tensor _in_feats,
                            torch::Tensor _gate_weight);
 
+// FP16 MoE TurboMind (SM70) — independent of AWQ path
+std::vector<torch::Tensor> sm70_f16_moe_build_strided_ptrs(
+    torch::Tensor tm_weights,
+    int64_t k_ld,
+    int64_t num_experts);
+
+void sm70_f16_moe_gemm_sm70_out(
+    torch::Tensor out,
+    torch::Tensor sorted_input,
+    torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w,
+    int64_t num_experts,
+    int64_t k,
+    int64_t n,
+    bool gated_silu);
+
 int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
                                const std::string& path);
 
