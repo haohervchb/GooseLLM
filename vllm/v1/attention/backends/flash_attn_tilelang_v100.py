@@ -11,9 +11,14 @@ from __future__ import annotations
 
 import os
 import sys
+import warnings
 from pathlib import Path
 
 import torch
+
+# Suppress noisy TVM FFI warnings from tilelang import
+warnings.filterwarnings("ignore", message="Field.*duplicates an ancestor field")
+warnings.filterwarnings("ignore", message=".*GemmSPWarpPolicy.*")
 
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionType

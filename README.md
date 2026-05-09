@@ -75,6 +75,7 @@ conda activate goosellm
 ### MoE Model (Qwen3.6-35B-A3B-AWQ)
 
 ```bash
+NCCL_P2P_LEVEL=NVL \
 python -m vllm.entrypoints.openai.api_server \
   --model QuantTrio/Qwen3.6-35B-A3B-AWQ \
   --tensor-parallel-size 4 \
@@ -95,6 +96,7 @@ python -m vllm.entrypoints.openai.api_server \
 ### Dense Model (Qwen3.6-27B-AWQ)
 
 ```bash
+NCCL_P2P_LEVEL=NVL \
 python -m vllm.entrypoints.openai.api_server \
   --model QuantTrio/Qwen3.6-27B-AWQ \
   --tensor-parallel-size 4 \
