@@ -413,6 +413,32 @@ class Qwen3_5Model(Qwen3NextModel):
         else:
             self.norm = PPMissingLayer()
 
+    def load_fused_expert_weights(
+        self,
+        name: str,
+        params_dict: dict,
+        loaded_weight: torch.Tensor,
+        shard_id: str,
+        num_experts: int,
+    ) -> bool:
+        param = params_dict[name]
+        weight_loader = param.weight_loader
+        loaded_local_expert = False
+        for expert_id in range(num_experts):
+            curr_expert_weight = loaded_weight[expert_id]
+            success = weight_loader(
+                param,
+                curr_expert_weight,
+                name,
+                shard_id,
+                expert_id,
+                return_success=True,
+            )
+            if success:
+                loaded_local_expert = True
+
+        return loaded_local_expert
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
@@ -434,6 +460,7 @@ class Qwen3_5Model(Qwen3NextModel):
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
         expert_params_mapping = self.get_expert_mapping()
+        is_fused_expert = False
         split_linear_attn_ba = any(
             ".linear_attn.in_proj_ba." in name for name in params_dict
         )
@@ -557,73 +584,75 @@ class Qwen3_5Model(Qwen3NextModel):
                     weight_loader(param, loaded_weight, shard_id)
                 break
             else:
-                # Handle FP16 fused MoE expert weights: split into per-expert tensors
-                # and load through existing weight_loader (handles TP sharding correctly)
-                if loaded_weight.dtype in (torch.float16, torch.bfloat16, torch.float32):
-                    if "experts.gate_up_proj" in name:
-                        # Fused [E*2*I, H] → per-expert [2*I, H] with gate(w1)+up(w3)
-                        E = loaded_weight.shape[0] // (2 * self.config.moe_intermediate_size)
-                        w = loaded_weight.view(E, -1, loaded_weight.shape[-1])
-                        for e in range(E):
-                            for shard_id, start in [("w1", 0), ("w3", 1)]:
-                                i_start = start * self.config.moe_intermediate_size
-                                i_end = i_start + self.config.moe_intermediate_size
-                                expert_w = w[e, i_start:i_end, :]
-                                for mapping in expert_params_mapping:
-                                    pn, wn, expert_id, sid = mapping
-                                    if expert_id == e and shard_id == sid and shard_id[0] in wn:
-                                        if pn in name:
-                                            continue
-                                        new_name = name.replace("experts.gate_up_proj", pn)
-                                        if new_name in params_dict:
-                                            param = params_dict[new_name]
-                                            param.weight_loader(
-                                                param, expert_w, new_name, shard_id, expert_id)
-                                            break
-                        loaded_params.add(name)
-                        continue
-                    elif "experts.down_proj" in name:
-                        # Fused [E*I, H] → per-expert [I, H] with down(w2)
-                        E = loaded_weight.shape[0] // self.config.moe_intermediate_size
-                        w = loaded_weight.view(E, -1, loaded_weight.shape[-1])
-                        for e in range(E):
-                            expert_w = w[e]
-                            for mapping in expert_params_mapping:
-                                pn, wn, expert_id, sid = mapping
-                                if expert_id == e and sid == "w2" and "down" in wn:
-                                    new_name = name.replace("experts.down_proj", pn)
-                                    if new_name in params_dict:
-                                        param = params_dict[new_name]
-                                        param.weight_loader(
-                                            param, expert_w, new_name, sid, expert_id)
-                                        break
-                        loaded_params.add(name)
-                        continue
+                # Determine if this is a fused 3D expert weight (BF16) or
+                # per-expert 2D weights (AWQ). BF16 stores gate_up_proj as
+                # [E, 2*I, H] and down_proj as [E, H, I] (3D fused per-expert).
+                if "experts.gate_up_proj" in name or "experts.down_proj" in name:
+                    is_fused_expert = True
+                    base_layer = (
+                        "base_layer."
+                        if any(".base_layer." in n for n in params_dict)
+                        else ""
+                    )
+                    expert_params_mapping = [
+                        (f"experts.{base_layer}w13_weight", "experts.gate_up_proj", 0, "w1"),
+                        (f"experts.{base_layer}w2_weight", "experts.down_proj", 0, "w2"),
+                    ]
 
+                is_expert_weight = False
                 for mapping in expert_params_mapping:
                     param_name, weight_name, expert_id, shard_id = mapping
                     if weight_name not in name:
                         continue
-                    name = name.replace(weight_name, param_name)
-                    if is_pp_missing_parameter(name, self):
+                    is_expert_weight = True
+                    name_mapped = name.replace(weight_name, param_name)
+                    if is_pp_missing_parameter(name_mapped, self):
                         continue
-                    if (
-                        name.endswith(".bias") or name.endswith("_bias")
-                    ) and name not in params_dict:
-                        continue
-                    if name not in params_dict:
-                        continue
-                    param = params_dict[name]
-                    weight_loader = param.weight_loader
-                    weight_loader(
-                        param,
-                        loaded_weight,
-                        name,
-                        shard_id=shard_id,
-                        expert_id=expert_id,
-                    )
-                    break
+                    if is_fused_expert:
+                        # BF16 3D fused expert weights [E, ...]
+                        if "experts.gate_up_proj" in name:
+                            # [E, 2*I, H] → split into w1 [E, I, H] and w3 [E, I, H]
+                            w1, w3 = loaded_weight.chunk(2, dim=-2)
+                            num_experts = loaded_weight.shape[0]
+                            success = self.load_fused_expert_weights(
+                                name_mapped, params_dict, w1, "w1", num_experts
+                            ) and self.load_fused_expert_weights(
+                                name_mapped, params_dict, w3, "w3", num_experts
+                            )
+                        else:
+                            # down_proj [E, H, I]
+                            num_experts = loaded_weight.shape[0]
+                            success = self.load_fused_expert_weights(
+                                name_mapped, params_dict, loaded_weight, "w2", num_experts
+                            )
+                        if success:
+                            name = name_mapped
+                            break
+                    else:
+                        # Per-expert 2D weights (AWQ)
+                        if (
+                            name_mapped.endswith(".bias")
+                            or name_mapped.endswith("_bias")
+                        ) and name_mapped not in params_dict:
+                            continue
+                        if name_mapped not in params_dict:
+                            continue
+                        param = params_dict[name_mapped]
+                        weight_loader = param.weight_loader
+                        success = weight_loader(
+                            param,
+                            loaded_weight,
+                            name_mapped,
+                            shard_id=shard_id,
+                            expert_id=expert_id,
+                            return_success=True,
+                        )
+                        if success:
+                            name = name_mapped
+                            break
                 else:
+                    if is_expert_weight:
+                        continue
                     if name.endswith(".bias") and name not in params_dict:
                         continue
                     if is_pp_missing_parameter(name, self):

@@ -146,6 +146,8 @@ def _iter_unique_moe_layers(model: torch.nn.Module) -> Iterable[torch.nn.Module]
     for layer in model.modules():
         if not getattr(layer, "sm70_batched_ready", False):
             continue
+        if not hasattr(layer, "w13_tm_scales"):
+            continue
         group_size = _group_size_from_tm_scales(
             int(layer.sm70_w13_k_dim), layer.w13_tm_scales[0]
         )

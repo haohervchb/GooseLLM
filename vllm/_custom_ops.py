@@ -727,6 +727,52 @@ if hasattr(torch.ops._C, "sm70_f16_gate_mul_out"):
         return None
 
 
+def sm70_f16_moe_build_strided_ptrs(
+    tm_weights: torch.Tensor, k_ld: int, num_experts: int
+) -> list[torch.Tensor]:
+    return torch.ops._C.sm70_f16_moe_build_strided_ptrs(
+        tm_weights, k_ld, num_experts
+    )
+
+
+def sm70_f16_moe_gemm_sm70_out(
+    out: torch.Tensor,
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    num_experts: int,
+    k: int,
+    n: int,
+    gated_silu: bool,
+) -> None:
+    torch.ops._C.sm70_f16_moe_gemm_sm70_out(
+        out, sorted_input, expert_offsets, strided_ptrs_w,
+        num_experts, k, n, gated_silu
+    )
+
+
+if hasattr(torch.ops._C, "sm70_f16_moe_build_strided_ptrs"):
+
+    @register_fake("_C::sm70_f16_moe_build_strided_ptrs")
+    def _sm70_f16_moe_build_strided_ptrs_fake(
+        tm_weights: torch.Tensor, k_ld: int, num_experts: int
+    ) -> list[torch.Tensor]:
+        return [torch.empty(0, dtype=torch.uint8, device=tm_weights.device)]
+
+    @register_fake("_C::sm70_f16_moe_gemm_sm70_out")
+    def _sm70_f16_moe_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        _in_feats: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        num_experts: int,
+        k: int,
+        n: int,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
 def awq_moe_build_strided_ptrs(
     tm_weights: torch.Tensor,
     tm_scales: torch.Tensor,
