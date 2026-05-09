@@ -9,6 +9,10 @@ Same metadata builder as FLASH_ATTN_V100. No breaking changes.
 
 from __future__ import annotations
 
+import os
+import sys
+from pathlib import Path
+
 import torch
 
 from vllm.logger import init_logger
@@ -21,6 +25,14 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionImpl,
     TritonAttentionMetadata,
 )
+
+# Auto-discover tilelang + tilelang-fa-v100 from 3rdparty submodules
+# (installed via cmake build, not pip, so won't be on sys.path by default)
+_repo_root = Path(__file__).resolve().parents[4]
+_tl_3rd = _repo_root / "3rdparty"
+for _p in [_tl_3rd / "tilelang", _tl_3rd / "tilelang-fa-v100"]:
+    if _p.exists() and str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 logger = init_logger(__name__)
 

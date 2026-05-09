@@ -47,6 +47,14 @@ sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_ava
 python setup.py build_ext --inplace
 cd ../..
 
+# 4.5 Build TileLang (optional — needed for FLASH_ATTN_TILELANG_V100 backend)
+cd 3rdparty/tilelang
+cmake -S . -B build -DUSE_CUDA=ON
+cmake --build build -j$(nproc)
+cd ../..
+# 4.6 Install TileLang FA-V100 kernels (pure Python, --no-deps avoids torch conflict)
+pip install --no-deps -e 3rdparty/tilelang-fa-v100/
+
 # 5. Build vLLM wheel (matches 1Cat's original process)
 rm -rf build vllm.egg-info .deps/*-build .deps/*-subbuild
 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
@@ -76,7 +84,7 @@ python -m vllm.entrypoints.openai.api_server \
   --max-num-seqs 1 \
   --max-num-batched-tokens 16384 \
   --trust-remote-code \
-  --attention-backend FLASH_ATTN_V100 \
+  --attention-backend FLASH_ATTN_TILELANG_V100 \
   --skip-mm-profiling \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
@@ -96,7 +104,7 @@ python -m vllm.entrypoints.openai.api_server \
   --max-num-seqs 1 \
   --max-num-batched-tokens 16384 \
   --trust-remote-code \
-  --attention-backend FLASH_ATTN_V100 \
+  --attention-backend FLASH_ATTN_TILELANG_V100 \
   --skip-mm-profiling \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
@@ -124,7 +132,7 @@ docker run --rm \
     --max-num-seqs 1 \
     --max-num-batched-tokens 16384 \
     --skip-mm-profiling \
-    --attention-backend FLASH_ATTN_V100 \
+    --attention-backend FLASH_ATTN_TILELANG_V100 \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' 
 ```
@@ -149,7 +157,7 @@ docker run --rm \
     --max-num-seqs 1 \
     --max-num-batched-tokens 16384 \
     --skip-mm-profiling \
-    --attention-backend FLASH_ATTN_V100 \
+    --attention-backend FLASH_ATTN_TILELANG_V100 \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
     --host 0.0.0.0 \

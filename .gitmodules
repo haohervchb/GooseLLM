@@ -1,0 +1,6 @@
+[submodule "3rdparty/tilelang-fa-v100"]
+	path = 3rdparty/tilelang-fa-v100
+	url = https://github.com/haohervchb/Tilelang-FA-V100.git
+[submodule "3rdparty/tilelang"]
+	path = 3rdparty/tilelang
+	url = https://github.com/tile-ai/tilelang.git
