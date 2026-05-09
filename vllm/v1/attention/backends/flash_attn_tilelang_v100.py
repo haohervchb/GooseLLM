@@ -31,11 +31,12 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
 
-# Auto-discover tilelang + tilelang-fa-v100 from 3rdparty submodules
-# (installed via cmake build, not pip, so won't be on sys.path by default)
+# Auto-discover tilelang + tilelang-fa-v100
+# Checks multiple locations: 3rdparty submodules, user's local build, PYTHONPATH
 _repo_root = Path(__file__).resolve().parents[4]
 _tl_3rd = _repo_root / "3rdparty"
-for _p in [_tl_3rd / "tilelang", _tl_3rd / "tilelang-fa-v100"]:
+_tl_home = Path.home() / "tilelang"
+for _p in [_tl_3rd / "tilelang-fa-v100", _tl_home]:
     if _p.exists() and str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 

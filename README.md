@@ -47,12 +47,7 @@ sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_ava
 python setup.py build_ext --inplace
 cd ../..
 
-# 4.5 Build TileLang (optional — needed for FLASH_ATTN_TILELANG_V100 backend)
-cd 3rdparty/tilelang
-cmake -S . -B build -DUSE_CUDA=ON
-cmake --build build -j$(nproc)
-cd ../..
-# 4.6 Install TileLang FA-V100 kernels (pure Python, --no-deps avoids torch conflict)
+# 4.5 Install TileLang FA-V100 kernels (pure Python, --no-deps avoids torch conflict)
 pip install --no-deps -e 3rdparty/tilelang-fa-v100/
 
 # 5. Build vLLM wheel (matches 1Cat's original process)
