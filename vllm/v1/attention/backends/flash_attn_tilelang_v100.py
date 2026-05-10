@@ -115,7 +115,9 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             prefix_kv_lens = seq_lens - query_lens
             prefix_kv_lens = torch.clamp(prefix_kv_lens, min=0)
 
-        torch.cuda.synchronize()
+        # Synchronize only outside CUDA graph capture
+        if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
+            torch.cuda.synchronize()
         causal = getattr(attn_metadata, "causal", True)
 
         _, softmax_lse = self.tilelang_paged(
@@ -166,7 +168,9 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                                        dtype=torch.int32, device=query_flat.device)
         prefix_kv_lens = seq_lens - 1  # prefix = total KV minus the single decode token
 
-        torch.cuda.synchronize()
+        # Synchronize only outside CUDA graph capture
+        if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
+            torch.cuda.synchronize()
 
         _, _ = self.tilelang_paged(
             q_padded, k_cache, v_cache, block_table, seq_lens,
