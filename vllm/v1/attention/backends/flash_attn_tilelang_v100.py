@@ -131,7 +131,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                 self, layer, query, key, value, kv_cache,
                 attn_metadata, output,
             )
-        return softmax_lse
+        return output
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
