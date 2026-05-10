@@ -49,7 +49,6 @@ _tilelang_paged_forward = None
 _warned_missing = False
 _warned_prefill = False
 _logged_prefill = False
-_logged_decode = False
 
 
 def _get_tilelang_ops():
@@ -65,7 +64,7 @@ def _get_tilelang_ops():
 
 
 class FlashAttnTileLangV100Impl(TritonAttentionImpl):
-    """TileLang paged prefill and decode, Triton fallback for edge cases."""
+    """TileLang paged prefill, Triton fallback for decode and edge cases."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -195,7 +194,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
-        global _warned_missing, _warned_prefill, _logged_prefill, _logged_decode
+        global _warned_missing, _warned_prefill, _logged_prefill
 
         if attn_metadata is None:
             assert output is not None
@@ -239,12 +238,9 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: tilelang path (padded prefill kernel)
-        if not _logged_decode:
-            logger.info("FLASH_ATTN_TILELANG_V100 tilelang decode path active.")
-            _logged_decode = True
-        return self._tilelang_decode(
-            layer, query, key, value, kv_cache, attn_metadata, output)
+        # Decode: Triton path (tilelang decode with padded Q needs debugging)
+        return super().forward(layer, query, key, value, kv_cache,
+                               attn_metadata, output, output_scale, output_block_scale)
 
     def _supports_path(self):
         return (
