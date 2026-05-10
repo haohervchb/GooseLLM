@@ -220,7 +220,11 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: tilelang path (padded prefill kernel)
+        # Decode: fall back to Triton during CUDA graph capture (kernel produces NaN during dummy runs)
+        if is_capturing:
+            return super().forward(layer, query, key, value, kv_cache,
+                                   attn_metadata, output, output_scale, output_block_scale)
+
         if not _logged_decode:
             logger.info("FLASH_ATTN_TILELANG_V100 tilelang decode path active.")
             _logged_decode = True
