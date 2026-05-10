@@ -147,11 +147,11 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         """Decode: shared-memory softmax kernel (avoids 1D fragment layout conflict)."""
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
-        if kv_cache.numel() == 0:
-            return output.fill_(0)
-        seq_lens = attn_metadata.seq_lens
-        if seq_lens.max().item() == 0:
-            return output.fill_(0)
+        if not is_capturing:
+            if kv_cache.numel() == 0:
+                return output.fill_(0)
+            if attn_metadata.seq_lens.max().item() == 0:
+                return output.fill_(0)
 
         query_flat = query[:attn_metadata.num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(1)
@@ -159,7 +159,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
         result = self.tilelang_decode(
-            query_flat, k_cache, v_cache, attn_metadata.block_table, seq_lens,
+            query_flat, k_cache, v_cache, attn_metadata.block_table, attn_metadata.seq_lens,
             block_size=k_cache.shape[1],
             num_kv_heads=key.shape[1],
             softmax_scale=self.scale,
