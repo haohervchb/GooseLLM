@@ -14,12 +14,16 @@ import sys
 import warnings
 from pathlib import Path
 
-import torch
+# Ensure local patched tilelang is found BEFORE site-packages
+_tl_home = Path.home() / "tilelang"
+if _tl_home.exists() and str(_tl_home) not in sys.path:
+    sys.path.insert(0, str(_tl_home))
 
-# Suppress noisy TVM FFI warnings from tilelang import
+# Suppress noisy TVM FFI warnings
 warnings.filterwarnings("ignore", message="Field.*duplicates an ancestor field")
 warnings.filterwarnings("ignore", message=".*GemmSPWarpPolicy.*")
 
+import torch
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import AttentionType
 from vllm.v1.attention.backends.flash_attn_v100 import (
@@ -31,14 +35,11 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
 )
 
-# Auto-discover tilelang + tilelang-fa-v100
-# Checks multiple locations: 3rdparty submodules, user's local build, PYTHONPATH
+# Auto-discover tilelang-fa-v100 from 3rdparty submodule
 _repo_root = Path(__file__).resolve().parents[4]
-_tl_3rd = _repo_root / "3rdparty"
-_tl_home = Path.home() / "tilelang"
-for _p in [_tl_3rd / "tilelang-fa-v100", _tl_home]:
-    if _p.exists() and str(_p) not in sys.path:
-        sys.path.insert(0, str(_p))
+_tl_3rd_fa = _repo_root / "3rdparty" / "tilelang-fa-v100"
+if _tl_3rd_fa.exists() and str(_tl_3rd_fa) not in sys.path:
+    sys.path.insert(0, str(_tl_3rd_fa))
 
 logger = init_logger(__name__)
 
