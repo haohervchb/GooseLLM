@@ -46,6 +46,7 @@ if _tl_3rd_fa.exists() and str(_tl_3rd_fa) not in sys.path:
 logger = init_logger(__name__)
 
 _tilelang_paged_forward = None
+_tilelang_decode_forward = None
 _warned_missing = False
 _warned_prefill = False
 _logged_prefill = False
@@ -53,15 +54,17 @@ _logged_decode = False
 
 
 def _get_tilelang_ops():
-    global _tilelang_paged_forward
-    if _tilelang_paged_forward is not None:
-        return _tilelang_paged_forward
-    try:
-        import tilelang_fa_v100
-        _tilelang_paged_forward = getattr(tilelang_fa_v100, "tilelang_paged_forward", None)
-    except ImportError:
-        pass
-    return _tilelang_paged_forward
+    global _tilelang_paged_forward, _tilelang_decode_forward
+    if _tilelang_paged_forward is None or _tilelang_decode_forward is None:
+        try:
+            import tilelang_fa_v100
+            if _tilelang_paged_forward is None:
+                _tilelang_paged_forward = getattr(tilelang_fa_v100, "tilelang_paged_forward", None)
+            if _tilelang_decode_forward is None:
+                _tilelang_decode_forward = getattr(tilelang_fa_v100, "tilelang_decode_forward", None)
+        except ImportError:
+            pass
+    return _tilelang_paged_forward, _tilelang_decode_forward
 
 
 class FlashAttnTileLangV100Impl(TritonAttentionImpl):
@@ -69,7 +72,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.tilelang_paged = _get_tilelang_ops()
+        self.tilelang_paged, self.tilelang_decode = _get_tilelang_ops()
         self.use_tilelang_paged = self.tilelang_paged is not None
         self._tilelang_paged_ready = False
 
@@ -128,67 +131,41 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             num_kv_heads=key.shape[1],
         )
 
-        if torch.isnan(output).any():
-            if not _warned_prefill:
-                logger.warning("FLASH_ATTN_TILELANG_V100 NaN, falling back to Triton.")
-                _warned_prefill = True
-            return TritonAttentionImpl.forward(
-                self, layer, query, key, value, kv_cache,
-                attn_metadata, output,
-            )
+        if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
+            if torch.isnan(output).any():
+                if not _warned_prefill:
+                    logger.warning("FLASH_ATTN_TILELANG_V100 NaN, falling back to Triton.")
+                    _warned_prefill = True
+                return TritonAttentionImpl.forward(
+                    self, layer, query, key, value, kv_cache,
+                    attn_metadata, output,
+                )
         return output
 
     def _tilelang_decode(self, layer, query, key, value, kv_cache,
                          attn_metadata, output):
-        """Decode: pad Q to block_M=32 rows, call paged kernel, extract row 0."""
-        num_actual_tokens = attn_metadata.num_actual_tokens
-        batch_size = num_actual_tokens  # decode: 1 token per sequence
-        block_M = 32
+        """Decode: shared-memory softmax kernel (avoids 1D fragment layout conflict)."""
+        is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
-        # Empty KV cache (CUDA graph capture dummy run) — return zeros
         if kv_cache.numel() == 0:
             return output.fill_(0)
         seq_lens = attn_metadata.seq_lens
         if seq_lens.max().item() == 0:
             return output.fill_(0)
 
-        query_flat = query[:num_actual_tokens]  # [batch, heads, dim]
-        num_heads = query_flat.shape[1]
-        head_dim = query_flat.shape[2]
-
+        query_flat = query[:attn_metadata.num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(1)
         k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
         v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
-        block_table = attn_metadata.block_table
-
-        # Pad Q: one real token per batch + (block_M-1) zero rows per batch
-        q_padded = torch.zeros(batch_size * block_M, num_heads, head_dim,
-                               dtype=query_flat.dtype, device=query_flat.device)
-        for b in range(batch_size):
-            q_padded[b * block_M] = query_flat[b]
-
-        out_padded = torch.empty_like(q_padded)
-
-        query_start_loc = torch.arange(0, (batch_size + 1) * block_M, block_M,
-                                       dtype=torch.int32, device=query_flat.device)
-        prefix_kv_lens = seq_lens - 1  # prefix = total KV minus the single decode token
-
-        _, _ = self.tilelang_paged(
-            q_padded, k_cache, v_cache, block_table, seq_lens,
-            query_start_loc, prefix_kv_lens,
-            out=out_padded, block_size=k_cache.shape[1],
-            softmax_scale=self.scale,
-            causal=False,  # decode attends to all past KV — no causal mask needed
+        result = self.tilelang_decode(
+            query_flat, k_cache, v_cache, attn_metadata.block_table, seq_lens,
+            block_size=k_cache.shape[1],
             num_kv_heads=key.shape[1],
+            softmax_scale=self.scale,
         )
+        output[:attn_metadata.num_actual_tokens].copy_(result)
 
-        # Extract only the real rows (every block_M-th row)
-        for b in range(batch_size):
-            output[b] = out_padded[b * block_M]
-
-        # NaN check — skip during CUDA graph capture (GPU→CPU sync illegal)
-        is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
         if not is_capturing and torch.isnan(output).any():
             logger.warning("FLASH_ATTN_TILELANG_V100 decode NaN, falling back to Triton.")
             return TritonAttentionImpl.forward(
@@ -253,6 +230,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
     def _supports_path(self):
         return (
             self.use_tilelang_paged
+            and self.tilelang_decode is not None
             and self.attn_type == AttentionType.DECODER
             and self.alibi_slopes is None
             and self.logits_soft_cap == 0
