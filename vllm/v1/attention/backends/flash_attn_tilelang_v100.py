@@ -220,16 +220,13 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: fall back to Triton during CUDA graph capture (kernel produces NaN during dummy runs)
-        if is_capturing:
-            return super().forward(layer, query, key, value, kv_cache,
-                                   attn_metadata, output, output_scale, output_block_scale)
+        # Decode: Triton (faster than tilelang decode which wastes 15/16 MMA on padded rows)
+        return super().forward(layer, query, key, value, kv_cache,
+                               attn_metadata, output, output_scale, output_block_scale)
 
-        if not _logged_decode:
-            logger.info("FLASH_ATTN_TILELANG_V100 tilelang decode path active.")
-            _logged_decode = True
-        return self._tilelang_decode(
-            layer, query, key, value, kv_cache, attn_metadata, output)
+        # The tilelang decode kernel (shared-memory softmax) is available but slower
+        # for single-token decode due to SM70 MMA requiring block_M >= 16.
+        # Kept for reference in _tilelang_decode.
 
     def _supports_path(self):
         return (
