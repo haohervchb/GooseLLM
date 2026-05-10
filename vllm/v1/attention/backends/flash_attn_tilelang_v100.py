@@ -1,10 +1,12 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """TileLang-optimized FlashAttention V100 backend for SM70.
-
-Uses tilelang_fa_v100 JIT-compiled kernels for paged prefill.
-Decode falls back to Triton (or SM70 decode kernel if FA-V100 is also available).
-Same metadata builder as FLASH_ATTN_V100. No breaking changes.
+ 
+ Uses tilelang_fa_v100 JIT-compiled kernels for paged prefill AND decode.
+ Prefill: direct paged kernel call.
+ Decode:  pads single Q token to block_M=32 rows, calls same paged kernel,
+          takes only row 0 of output.
+ Same metadata builder as FLASH_ATTN_V100. No breaking changes.
 """
 
 from __future__ import annotations
@@ -47,6 +49,7 @@ _tilelang_paged_forward = None
 _warned_missing = False
 _warned_prefill = False
 _logged_prefill = False
+_logged_decode = False
 
 
 def _get_tilelang_ops():
@@ -62,7 +65,7 @@ def _get_tilelang_ops():
 
 
 class FlashAttnTileLangV100Impl(TritonAttentionImpl):
-    """TileLang paged prefill, Triton fallback for decode and edge cases."""
+    """TileLang paged prefill and decode, Triton fallback for edge cases."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -133,9 +136,62 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             )
         return output
 
+    def _tilelang_decode(self, layer, query, key, value, kv_cache,
+                         attn_metadata, output):
+        """Decode: pad Q to block_M=32 rows, call paged kernel, extract row 0."""
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        batch_size = num_actual_tokens  # decode: 1 token per sequence
+        block_M = 32
+
+        query_flat = query[:num_actual_tokens]  # [batch, heads, dim]
+        num_heads = query_flat.shape[1]
+        head_dim = query_flat.shape[2]
+
+        key_cache, value_cache = kv_cache.unbind(1)
+        k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
+        v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
+
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+
+        # Pad Q: one real token per batch + (block_M-1) zero rows per batch
+        q_padded = torch.zeros(batch_size * block_M, num_heads, head_dim,
+                               dtype=query_flat.dtype, device=query_flat.device)
+        for b in range(batch_size):
+            q_padded[b * block_M] = query_flat[b]
+
+        out_padded = torch.empty_like(q_padded)
+
+        query_start_loc = torch.arange(0, (batch_size + 1) * block_M, block_M,
+                                       dtype=torch.int32, device=query_flat.device)
+        prefix_kv_lens = seq_lens - 1  # prefix = total KV minus the single decode token
+
+        torch.cuda.synchronize()
+
+        _, _ = self.tilelang_paged(
+            q_padded, k_cache, v_cache, block_table, seq_lens,
+            query_start_loc, prefix_kv_lens,
+            out=out_padded, block_size=k_cache.shape[1],
+            softmax_scale=self.scale,
+            causal=False,  # decode attends to all past KV — no causal mask needed
+            num_kv_heads=key.shape[1],
+        )
+
+        # Extract only the real rows (every block_M-th row)
+        for b in range(batch_size):
+            output[b] = out_padded[b * block_M]
+
+        if torch.isnan(output).any():
+            logger.warning("FLASH_ATTN_TILELANG_V100 decode NaN, falling back to Triton.")
+            return TritonAttentionImpl.forward(
+                self, layer, query, key, value, kv_cache,
+                attn_metadata, output,
+            )
+        return output
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
-        global _warned_missing, _warned_prefill, _logged_prefill
+        global _warned_missing, _warned_prefill, _logged_prefill, _logged_decode
 
         if attn_metadata is None:
             assert output is not None
@@ -179,9 +235,12 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: Triton path
-        return super().forward(layer, query, key, value, kv_cache,
-                               attn_metadata, output, output_scale, output_block_scale)
+        # Decode: tilelang path (padded prefill kernel)
+        if not _logged_decode:
+            logger.info("FLASH_ATTN_TILELANG_V100 tilelang decode path active.")
+            _logged_decode = True
+        return self._tilelang_decode(
+            layer, query, key, value, kv_cache, attn_metadata, output)
 
     def _supports_path(self):
         return (
