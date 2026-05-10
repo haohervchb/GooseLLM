@@ -49,6 +49,7 @@ _tilelang_paged_forward = None
 _warned_missing = False
 _warned_prefill = False
 _logged_prefill = False
+_logged_decode = False
 
 
 def _get_tilelang_ops():
@@ -64,7 +65,7 @@ def _get_tilelang_ops():
 
 
 class FlashAttnTileLangV100Impl(TritonAttentionImpl):
-    """TileLang paged prefill, Triton fallback for decode and edge cases."""
+    """TileLang paged prefill and decode, Triton fallback for edge cases."""
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
@@ -144,6 +145,13 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         batch_size = num_actual_tokens  # decode: 1 token per sequence
         block_M = 32
 
+        # Empty KV cache (CUDA graph capture dummy run) — return zeros
+        if kv_cache.numel() == 0:
+            return output.fill_(0)
+        seq_lens = attn_metadata.seq_lens
+        if seq_lens.max().item() == 0:
+            return output.fill_(0)
+
         query_flat = query[:num_actual_tokens]  # [batch, heads, dim]
         num_heads = query_flat.shape[1]
         head_dim = query_flat.shape[2]
@@ -152,7 +160,6 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
         v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
-        seq_lens = attn_metadata.seq_lens
         block_table = attn_metadata.block_table
 
         # Pad Q: one real token per batch + (block_M-1) zero rows per batch
@@ -167,10 +174,6 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                                        dtype=torch.int32, device=query_flat.device)
         prefix_kv_lens = seq_lens - 1  # prefix = total KV minus the single decode token
 
-        # Synchronize only outside CUDA graph capture
-        if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
-            torch.cuda.synchronize()
-
         _, _ = self.tilelang_paged(
             q_padded, k_cache, v_cache, block_table, seq_lens,
             query_start_loc, prefix_kv_lens,
@@ -184,7 +187,9 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         for b in range(batch_size):
             output[b] = out_padded[b * block_M]
 
-        if torch.isnan(output).any():
+        # NaN check — skip during CUDA graph capture (GPU→CPU sync illegal)
+        is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
+        if not is_capturing and torch.isnan(output).any():
             logger.warning("FLASH_ATTN_TILELANG_V100 decode NaN, falling back to Triton.")
             return TritonAttentionImpl.forward(
                 self, layer, query, key, value, kv_cache,
@@ -194,7 +199,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
-        global _warned_missing, _warned_prefill, _logged_prefill
+        global _warned_missing, _warned_prefill, _logged_prefill, _logged_decode
 
         if attn_metadata is None:
             assert output is not None
@@ -238,9 +243,12 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: Triton path (tilelang decode with padded Q needs debugging)
-        return super().forward(layer, query, key, value, kv_cache,
-                               attn_metadata, output, output_scale, output_block_scale)
+        # Decode: tilelang path (padded prefill kernel)
+        if not _logged_decode:
+            logger.info("FLASH_ATTN_TILELANG_V100 tilelang decode path active.")
+            _logged_decode = True
+        return self._tilelang_decode(
+            layer, query, key, value, kv_cache, attn_metadata, output)
 
     def _supports_path(self):
         return (
