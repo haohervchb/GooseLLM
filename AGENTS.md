@@ -52,6 +52,8 @@ The `FLASH_ATTN_V100` attention backend is selected automatically when:
 | `VLLM_CUSTOM_ALLREDUCE_ALGO` | `1stage` or `2stage` for decode |
 | `NCCL_P2P_LEVEL=NVL` | Force NVLink for NCCL |
 | `VLLM_DISABLE_PYNCCL=1` | Disable pynccl (not recommended) |
+| `VLLM_USE_SM70_DECODE=0` | Disable SM70 decode kernel (default: enabled) |
+| `VLLM_DEBUG_CHECK_NAN=1` | Enable NaN/Inf checks in model runner hot path (default: off) |
 | `--disable-custom-all-reduce` | Disable custom AR (not recommended) |
 
 ## Known Limitations
