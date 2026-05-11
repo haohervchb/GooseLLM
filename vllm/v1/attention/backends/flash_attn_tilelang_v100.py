@@ -102,6 +102,8 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
+        key = key[:num_actual_tokens] if key is not None else None
+        value = value[:num_actual_tokens] if value is not None else None
         out_view = output[:num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(1)
         k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
