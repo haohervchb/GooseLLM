@@ -324,12 +324,13 @@ class SM70FP16MoEMethod(FusedMoEMethodBase):
         token_expert_indices = buffers["token_expert_indices"]
 
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        expert_map = getattr(layer, "_expert_map", None)
         torch.ops._moe_C.moe_permute(
             x,
             topk_ids_i32,
             token_expert_indices,
-            None,
-            num_experts,
+            expert_map,
+            getattr(layer, "global_num_experts", num_experts),
             num_experts,
             top_k,
             None,
@@ -432,6 +433,14 @@ class SM70FP16MoEMethod(FusedMoEMethodBase):
         token_origin = (
             torch.arange(num_tokens, device=x.device, dtype=torch.int64)
             .unsqueeze(1).expand(num_tokens, top_k).reshape(-1))
+
+        expert_map = getattr(layer, "_expert_map", None)
+        if expert_map is not None:
+            flat_ids = expert_map[flat_ids]
+            valid = flat_ids >= 0
+            flat_ids = flat_ids[valid]
+            flat_weights = flat_weights[valid]
+            token_origin = token_origin[valid]
 
         sorted_order = torch.argsort(flat_ids.long(), stable=True)
         sorted_token_origin = token_origin[sorted_order]

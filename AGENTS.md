@@ -58,6 +58,5 @@ The `FLASH_ATTN_V100` attention backend is selected automatically when:
 
 ## Known Limitations
 
-- **AWQ SM70 + Expert Parallelism**: Not yet supported. AWQ SM70 MoE kernel assumes all experts are local. EP requires expert ID remapping.
 - **Spark/m8n8k4 paths**: Disabled by default (performance-negative).
 - **GQA-shared-KV grid**: Implemented but disabled (performance-negative).
