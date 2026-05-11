@@ -204,17 +204,12 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
         if is_prefill:
-            if is_capturing:
-                if not causal:
-                    raise RuntimeError("FLASH_ATTN_TILELANG_V100: non-causal prefill during CUDA graph capture.")
-                return super().forward(layer, query, key, value, kv_cache,
-                                       attn_metadata, output, output_scale, output_block_scale)
             if not self._ensure_paged_ready():
                 if not causal:
                     raise RuntimeError("FLASH_ATTN_TILELANG_V100 paged kernel not ready for non-causal.")
                 return super().forward(layer, query, key, value, kv_cache,
                                        attn_metadata, output, output_scale, output_block_scale)
-            if not _logged_prefill:
+            if not _logged_prefill and not is_capturing:
                 logger.info("FLASH_ATTN_TILELANG_V100 paged prefill path active.")
                 _logged_prefill = True
             return self._tilelang_paged_prefill(
