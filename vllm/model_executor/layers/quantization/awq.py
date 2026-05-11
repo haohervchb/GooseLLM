@@ -116,6 +116,16 @@ class AWQConfig(QuantizationConfig):
                 return UnquantizedLinearMethod()
             return AWQLinearMethod(self)
         elif isinstance(layer, FusedMoE):
+            # Respect modules_to_not_convert (e.g. layer 0 in some
+            # Qwen3.5 checkpoints stores BF16 weights, not AWQ qweight).
+            if is_layer_skipped(
+                prefix,
+                self.modules_to_not_convert,
+                self.packed_modules_mapping,
+                skip_with_substr=True,
+            ):
+                return None  # fall back to SM70FP16MoE or UnquantizedFusedMoE
+
             # SM70 (V100): use TurboMind GEMM kernels for MoE,
             # since Marlin requires SM75+.
             if self._is_sm70_available():
