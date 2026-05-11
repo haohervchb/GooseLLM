@@ -4,6 +4,7 @@
 import functools
 import gc
 import itertools
+import os
 import threading
 import time
 from collections import defaultdict
@@ -194,6 +195,13 @@ if TYPE_CHECKING:
     from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
 logger = init_logger(__name__)
+
+# Gated NaN/Inf diagnostics — guarded behind VLLM_DEBUG_CHECK_NAN to avoid
+# CUDA device→host synchronization overhead in the production hot path.
+# Set VLLM_DEBUG_CHECK_NAN=1 to re-enable for debugging NaN/Inf issues.
+_ENABLE_NAN_DEBUG = os.environ.get(
+    "VLLM_DEBUG_CHECK_NAN", ""
+).strip() in ("1", "true", "yes")
 
 AttnMetadataDict: TypeAlias = dict[str, AttentionMetadata]
 # list when ubatching is enabled
@@ -3665,17 +3673,17 @@ class GPUModelRunner(
                 hidden_states = model_output
                 aux_hidden_states = None
 
-            # DEBUG: check target model hidden states for NaN/Inf
-            if torch.isnan(hidden_states).any():
-                logger.warning(
-                    "Target model hidden_states has NaN (shape=%s)",
-                    hidden_states.shape,
-                )
-            if torch.isinf(hidden_states).any():
-                logger.warning(
-                    "Target model hidden_states has Inf (shape=%s)",
-                    hidden_states.shape,
-                )
+            if _ENABLE_NAN_DEBUG:
+                if torch.isnan(hidden_states).any():
+                    logger.warning(
+                        "Target model hidden_states has NaN (shape=%s)",
+                        hidden_states.shape,
+                    )
+                if torch.isinf(hidden_states).any():
+                    logger.warning(
+                        "Target model hidden_states has Inf (shape=%s)",
+                        hidden_states.shape,
+                    )
 
             if not self.broadcast_pp_output:
                 # Common case.
@@ -4181,21 +4189,21 @@ class GPUModelRunner(
             else:
                 mm_embed_inputs = None
 
-            # DEBUG: check target hidden states before draft proposal
-            if torch.isnan(target_hidden_states).any():
-                logger.warning(
-                    "DFlash runner: target_hidden_states has NaN before propose "
-                    "(shape=%s num_scheduled=%d)",
-                    target_hidden_states.shape,
-                    num_scheduled_tokens,
-                )
-            if torch.isinf(target_hidden_states).any():
-                logger.warning(
-                    "DFlash runner: target_hidden_states has Inf before propose "
-                    "(shape=%s num_scheduled=%d)",
-                    target_hidden_states.shape,
-                    num_scheduled_tokens,
-                )
+            if _ENABLE_NAN_DEBUG:
+                if torch.isnan(target_hidden_states).any():
+                    logger.warning(
+                        "DFlash runner: target_hidden_states has NaN before propose "
+                        "(shape=%s num_scheduled=%d)",
+                        target_hidden_states.shape,
+                        num_scheduled_tokens,
+                    )
+                if torch.isinf(target_hidden_states).any():
+                    logger.warning(
+                        "DFlash runner: target_hidden_states has Inf before propose "
+                        "(shape=%s num_scheduled=%d)",
+                        target_hidden_states.shape,
+                        num_scheduled_tokens,
+                    )
 
             draft_token_ids = self.drafter.propose(
                 target_token_ids=target_token_ids,
