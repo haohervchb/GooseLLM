@@ -12,14 +12,30 @@ import warnings
 import torch
 from einops import rearrange
 
+import os
+import logging
+
 from .chunk_delta_h import chunk_gated_delta_rule_fwd_h
-from .chunk_o import chunk_fwd_o
-from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 from .cumsum import chunk_local_cumsum
 from .l2norm import l2norm_fwd
 from .solve_tril import solve_tril
 from .utils import SUPPRESS_LEVEL, input_guard
 from .wy_fast import recompute_w_u_fwd
+
+if os.environ.get("FLA_USE_TILELANG", "0") == "1":
+    try:
+        from .tilelang import chunk_fwd_o, chunk_scaled_dot_kkt_fwd
+        logging.getLogger(__name__).info(
+            "FLA_USE_TILELANG=1: "
+            "chunk_scaled_dot_kkt_fwd uses Tilelang (2x), "
+            "chunk_fwd_o uses Triton fallback"
+        )
+    except ImportError:
+        from .chunk_o import chunk_fwd_o
+        from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
+else:
+    from .chunk_o import chunk_fwd_o
+    from .chunk_scaled_dot_kkt import chunk_scaled_dot_kkt_fwd
 
 
 def chunk_gated_delta_rule_fwd(
