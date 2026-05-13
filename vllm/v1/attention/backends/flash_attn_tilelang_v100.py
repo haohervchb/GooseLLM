@@ -138,7 +138,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         _, softmax_lse = self.tilelang_paged(
             query, k_cache, v_cache, block_table, seq_lens,
             query_start_loc, prefix_kv_lens,
-            out=out_view, block_size=k_cache.shape[1],
+            out=out_view, block_size=16,
             softmax_scale=self.scale, causal=causal,
             num_kv_heads=key.shape[1],
         )
@@ -195,7 +195,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
         result = self.tilelang_decode(
             query_flat, k_cache, v_cache, attn_metadata.block_table, attn_metadata.seq_lens,
-            block_size=k_cache.shape[1],
+            block_size=16,
             num_kv_heads=key.shape[1],
             softmax_scale=self.scale,
         )
