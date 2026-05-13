@@ -289,6 +289,10 @@ class FlashAttnTileLangV100Backend(TritonAttentionBackend):
         return [64, 128, 256]
 
     @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int]:
+        return [16]
+
+    @staticmethod
     def get_kv_cache_stride_order(include_num_layers_dimension=False):
         if include_num_layers_dimension:
             return (1, 0, 2, 3, 4, 5)
