@@ -51,6 +51,7 @@ _warned_missing = False
 _warned_prefill = False
 _logged_prefill = False
 _logged_decode = False
+_diag_done = False
 
 
 def _get_tilelang_ops():
@@ -98,7 +99,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def _tilelang_paged_prefill(self, layer, query, key, value, kv_cache,
                                  attn_metadata, output):
-        global _warned_prefill
+        global _warned_prefill, _diag_done
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -123,6 +124,17 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             torch.cuda.synchronize()
         causal = getattr(attn_metadata, "causal", True)
 
+        if not _diag_done and not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
+            logger.info(
+                "TILELANG prefill diag: scale=%.6f, q=%s, k_cache=%s, "
+                "block_table=%s, seq_lens=%s, query_start_loc=%s, "
+                "prefix_kv_lens=%s, num_kv_heads=%d, block_size=%d",
+                self.scale, list(query.shape), list(k_cache.shape),
+                list(block_table.shape), seq_lens.tolist()[:4],
+                query_start_loc.tolist()[:4], prefix_kv_lens.tolist()[:4],
+                key.shape[1], k_cache.shape[1],
+            )
+
         _, softmax_lse = self.tilelang_paged(
             query, k_cache, v_cache, block_table, seq_lens,
             query_start_loc, prefix_kv_lens,
@@ -132,6 +144,29 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         )
 
         if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
+            if not _diag_done:
+                _diag_done = True
+                # One-shot correctness check: compare with Triton
+                try:
+                    triton_out = torch.zeros_like(output)
+                    TritonAttentionImpl.forward(
+                        self, layer, query, key, value, kv_cache,
+                        attn_metadata, triton_out,
+                    )
+                    tl_slice = output[:num_actual_tokens]
+                    tr_slice = triton_out[:num_actual_tokens]
+                    diff = (tl_slice - tr_slice).abs()
+                    logger.info(
+                        "TILELANG vs Triton: max_diff=%.6f, mean_diff=%.6f, "
+                        "tl_absmax=%.4f, tr_absmax=%.4f, any_nan_tl=%s, any_nan_tr=%s",
+                        diff.max().item(), diff.mean().item(),
+                        tl_slice.abs().max().item(), tr_slice.abs().max().item(),
+                        torch.isnan(tl_slice).any().item(),
+                        torch.isnan(tr_slice).any().item(),
+                    )
+                except Exception as e:
+                    logger.warning("TILELANG comparison failed: %s", e)
+
             if torch.isnan(output).any():
                 if not _warned_prefill:
                     logger.warning("FLASH_ATTN_TILELANG_V100 NaN, falling back to Triton.")
