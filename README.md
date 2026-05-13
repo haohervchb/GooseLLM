@@ -193,6 +193,13 @@ docker run --rm \
 
 ![MoE 122B vs Dense 27B throughput](tests/Comparison_QuantTrio_Qwen3.5-122B-A10B-AWQ_并发_1__vs_Qwen_Qwen3.6-27B_QwenQwen3.6-27B_concurrency_262144_vs_Qwen.png)
 
+## Known Limitations
+
+- **MTP / DFlash** — not working yet.
+- **Concurrent requests** — running more than 1 concurrent request may produce degraded results.
+- **Decode** — single-token decode falls back to Triton on TileLang backend (slower than FA-V100 backend's custom CUDA decode kernel).
+- **Gemma 4** — not supported yet.
+
 ## Environment Variables
 
 ### Attention / Decode
