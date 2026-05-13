@@ -51,6 +51,7 @@ _warned_missing = False
 _warned_prefill = False
 _logged_prefill = False
 _logged_decode = False
+_logged_mixed = False
 _diag_done = False
 
 
@@ -216,9 +217,109 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             )
         return output
 
+    def _tilelang_mixed_forward(self, layer, query, key, value, kv_cache,
+                                 attn_metadata, output):
+        """Mixed prefill+decode: prefill via TileLang paged, decode via Triton."""
+        qsl = attn_metadata.query_start_loc
+        seq_lens = attn_metadata.seq_lens
+        block_table = attn_metadata.block_table
+        query_lens = qsl[1:] - qsl[:-1]
+        is_pf = query_lens > 1
+        pf_idx = torch.where(is_pf)[0]
+        dec_idx = torch.where(~is_pf)[0]
+
+        # Decode elements via Triton
+        if len(dec_idx) > 0:
+            dec_total = len(dec_idx)
+            dec_starts = qsl[dec_idx]
+
+            dec_query = query.new_empty(dec_total, *query.shape[1:])
+            for i, s in enumerate(dec_starts):
+                dec_query[i] = query[s]
+
+            dec_meta = TritonAttentionMetadata(
+                num_actual_tokens=dec_total,
+                max_query_len=1,
+                query_start_loc=torch.arange(
+                    dec_total + 1, dtype=qsl.dtype, device=qsl.device),
+                max_seq_len=int(seq_lens[dec_idx].max().item()),
+                seq_lens=seq_lens[dec_idx],
+                block_table=block_table[dec_idx],
+                slot_mapping=attn_metadata.slot_mapping,
+                seq_threshold_3D=attn_metadata.seq_threshold_3D,
+                num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+                softmax_segm_output=attn_metadata.softmax_segm_output,
+                softmax_segm_max=attn_metadata.softmax_segm_max,
+                softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+                use_cascade=False,
+                common_prefix_len=0,
+                cu_prefix_query_lens=None,
+                prefix_kv_lens=None,
+                suffix_kv_lens=None,
+            )
+
+            dec_out = torch.empty_like(dec_query)
+            super().forward(layer, dec_query, key, value, kv_cache,
+                            dec_meta, dec_out)
+
+            for i, idx in enumerate(dec_idx.tolist()):
+                output[qsl[idx]:qsl[idx + 1]] = dec_out[i:i + 1]
+
+        # Prefill elements via TileLang
+        if len(pf_idx) > 0:
+            pf_starts = qsl[pf_idx]
+            pf_ends = qsl[pf_idx + 1]
+            pf_lens = pf_ends - pf_starts
+            pf_total = pf_lens.sum().item()
+
+            pf_query = query.new_empty(pf_total, *query.shape[1:])
+            offset = 0
+            for i, idx in enumerate(pf_idx.tolist()):
+                n = (qsl[idx + 1] - qsl[idx]).item()
+                pf_query[offset:offset + n] = query[
+                    qsl[idx]:qsl[idx + 1]]
+                offset += n
+
+            pf_qsl = torch.zeros(len(pf_idx) + 1, dtype=qsl.dtype,
+                                 device=qsl.device)
+            pf_qsl[1:] = pf_lens.cumsum(dim=0)
+
+            pf_meta = TritonAttentionMetadata(
+                num_actual_tokens=pf_total,
+                max_query_len=int(pf_lens.max().item()),
+                query_start_loc=pf_qsl,
+                max_seq_len=attn_metadata.max_seq_len,
+                seq_lens=seq_lens[pf_idx],
+                block_table=block_table[pf_idx],
+                slot_mapping=attn_metadata.slot_mapping,
+                seq_threshold_3D=attn_metadata.seq_threshold_3D,
+                num_par_softmax_segments=attn_metadata.num_par_softmax_segments,
+                softmax_segm_output=attn_metadata.softmax_segm_output,
+                softmax_segm_max=attn_metadata.softmax_segm_max,
+                softmax_segm_expsum=attn_metadata.softmax_segm_expsum,
+                use_cascade=False,
+                common_prefix_len=0,
+                cu_prefix_query_lens=None,
+                prefix_kv_lens=None,
+                suffix_kv_lens=None,
+            )
+            pf_meta.causal = getattr(attn_metadata, "causal", True)
+
+            pf_out = torch.empty_like(pf_query)
+            self._tilelang_paged_prefill(layer, pf_query, key, value,
+                                         kv_cache, pf_meta, pf_out)
+
+            offset = 0
+            for idx in pf_idx.tolist():
+                n = (qsl[idx + 1] - qsl[idx]).item()
+                output[qsl[idx]:qsl[idx + 1]] = pf_out[offset:offset + n]
+                offset += n
+
+        return output
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
-        global _warned_missing, _warned_prefill, _logged_prefill, _logged_decode
+        global _warned_missing, _warned_prefill, _logged_prefill, _logged_decode, _logged_mixed
 
         if attn_metadata is None:
             assert output is not None
@@ -251,6 +352,21 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                     raise RuntimeError("FLASH_ATTN_TILELANG_V100 paged kernel not ready for non-causal.")
                 return super().forward(layer, query, key, value, kv_cache,
                                        attn_metadata, output, output_scale, output_block_scale)
+
+            # Mixed batch: dispatch prefill and decode separately
+            if not is_capturing:
+                query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
+                has_decode = (query_lens == 1).any().item()
+                if has_decode:
+                    if not _logged_mixed:
+                        logger.info(
+                            "FLASH_ATTN_TILELANG_V100 mixed batch: prefill via "
+                            "TileLang, decode via Triton.")
+                        _logged_mixed = True
+                    return self._tilelang_mixed_forward(
+                        layer, query, key, value, kv_cache,
+                        attn_metadata, output)
+
             if not _logged_prefill and not is_capturing:
                 logger.info("FLASH_ATTN_TILELANG_V100 paged prefill path active.")
                 _logged_prefill = True
