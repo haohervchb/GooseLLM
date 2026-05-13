@@ -1,10 +1,19 @@
 # GooseLLM — vLLM for NVIDIA V100 (SM70)
 
-High-throughput LLM inference on Tesla V100 GPUs with custom FlashAttention-2 kernel from ai-bond.
+High-throughput LLM inference on Tesla V100 GPUs building on [1Cat-vLLM-0.0.2](https://github.com/1CatAI/1Cat-vLLM).
+
+This fork adds:
+
+- **TileLang JIT-compiled FlashAttention** — paged prefill kernel covering all attention layers (dense and MoE models). Compiled once per head dim during first request, no offline build step.
+- **TileLang-accelerated Gated DeltaNet / Flash Linear Attention** — SM70 kernel paths for hybrid MoE layers (`FLA_USE_TILELANG=1`).
+- **Hybrid model support** — automatically handles Qwen3.5-122B-A10B style mixed attention + GatedDeltaNet architectures (1056-token alignment pages split into 16-token sub-pages).
+- **AWQ expert parallelism** — `--enable-expert-parallel` for MoE models on multi-GPU.
+
+Upstream FA2 kernel (`csrc/flash_attention_v100/`), SM70 decode kernel, AWQ SM70 autotune, and custom all-reduce remain from the original 1Cat work.
 
 ## Acknowledgements
 
-Special thanks to [1CatAI](https://github.com/1CatAI/1Cat-vLLM) for their amazing V100 builds! Check out their repository for production-ready vLLM optimizations.
+Thanks to [1CatAI](https://github.com/1CatAI/1Cat-vLLM) for the upstream V100 vLLM builds and [tile-ai/tilelang](https://github.com/tile-ai/tilelang) for the TileLang JIT compiler framework.
 
 ## Quick Start
 
