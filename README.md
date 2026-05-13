@@ -7,7 +7,8 @@ This fork adds:
 - **TileLang JIT-compiled FlashAttention** — paged prefill kernel covering all attention layers (dense and MoE models). Compiled once per head dim during first request, no offline build step.
 - **TileLang-accelerated Gated DeltaNet / Flash Linear Attention** — SM70 kernel paths for hybrid MoE layers (`FLA_USE_TILELANG=1`).
 - **Hybrid model support** — automatically handles Qwen3.5-122B-A10B style mixed attention + GatedDeltaNet architectures (1056-token alignment pages split into 16-token sub-pages).
-- **AWQ expert parallelism** — `--enable-expert-parallel` for MoE models on multi-GPU.
+- **Expert parallelism** — `--enable-expert-parallel` for MoE models, works with both AWQ and FP16.
+- **FP16 inference** — supports Qwen3.6-35B-A3B and Qwen3.6-27B in FP16 mode (no quantization required).
 
 Upstream FA2 kernel (`csrc/flash_attention_v100/`), SM70 decode kernel, AWQ SM70 autotune, and custom all-reduce remain from the original 1Cat work.
 
