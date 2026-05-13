@@ -41,21 +41,26 @@ export TORCH_CUDA_ARCH_LIST=7.0
 export MAX_JOBS=$(nproc)
 export NVCC_THREADS=4
 
-# 4. Build SM70 kernel
+# 4. Build and install TileLang (from source with SM70 bf16 patches)
+cd ~/tilelang
+pip install -e .
+cd -
+
+# 4.5 Install TileLang FA-V100 kernels (pure Python JIT, depends on tilelang)
+pip install -e 3rdparty/tilelang-fa-v100/
+
+# 5. Build SM70 FA2 kernel (CUDA extension)
 cd csrc/flash_attention_v100
 sed -i 's/if not torch.cuda.is_available():/if False: # if not torch.cuda.is_available():/' setup.py
 python setup.py build_ext --inplace
 cd ../..
 
-# 4.5 Install TileLang FA-V100 kernels (pure Python, --no-deps avoids torch conflict)
-pip install --no-deps -e 3rdparty/tilelang-fa-v100/
-
-# 5. Build vLLM wheel (matches 1Cat's original process)
+# 6. Build vLLM wheel (matches 1Cat's original process)
 rm -rf build vllm.egg-info .deps/*-build .deps/*-subbuild
 SETUPTOOLS_SCM_PRETEND_VERSION=0.0.3.dev0 \
   python -m build --wheel --no-isolation --outdir dist-cu128-sm70
 
-# 6. Install
+# 7. Install
 python -m pip install dist-cu128-sm70/*.whl --no-deps
 ```
 

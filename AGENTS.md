@@ -37,6 +37,23 @@ The `FLASH_ATTN_V100` attention backend is selected automatically when:
 - `flash_attn_v100_cuda` module is importable
 - Model config passes readiness checks (no alibi/softcap/sliding_window/fp8)
 
+The `FLASH_ATTN_TILELANG_V100` attention backend is selected automatically when:
+- `--attention-backend FLASH_ATTN_TILELANG_V100` is passed
+- `tilelang_fa_v100` module is importable (from `3rdparty/tilelang-fa-v100/`)
+- `tilelang` package is installed
+- Model config passes the same readiness checks as FLASH_ATTN_V100
+- On SM70, `FLASH_ATTN_TILELANG_V100` is the highest-priority backend
+
+### TileLang FA-V100 Kernel Config
+
+Kernels are JIT-compiled via TileLang. Config per head_dim:
+
+| dim | block_M | block_N | threads | notes |
+|-----|---------|---------|---------|-------|
+| 64  | 32      | 128     | 256     |       |
+| 128 | 32      | 128     | 256     |       |
+| 256 | 64      | 32      | 256     | 1.3-1.5x faster than M32 N64 |
+
 ## Branch Policy
 
 - `main` — release branch (merge v100-fa2-paged-prefill work here)
