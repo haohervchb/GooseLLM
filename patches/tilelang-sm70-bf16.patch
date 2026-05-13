@@ -1,0 +1,132 @@
+diff --git a/src/tl_templates/cuda/common.h b/src/tl_templates/cuda/common.h
+index eba25730..f8e2ef46 100644
+--- a/src/tl_templates/cuda/common.h
++++ b/src/tl_templates/cuda/common.h
+@@ -97,7 +97,7 @@ TL_PATCH TL_DEVICE half_t __habs(const half_t x) {
+ 
+ // using cutlass abs function for bfloat_t
+ TL_PATCH TL_DEVICE bfloat16_t __habs(const bfloat16_t x) {
+-  return bfloat16_t(__habs(x.to_nv_bfloat16()));
++  return bfloat16_t(fabsf(__bfloat162float(x.to_nv_bfloat16())));
+ }
+ 
+ // hrsqrt function for half_t
+@@ -707,7 +707,7 @@ TL_DEVICE __nv_bfloat162 add2(__nv_bfloat162 a, __nv_bfloat162 b) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __hadd2(a, b);
+ #else
+-  return __nv_bfloat162{__hadd(a.x, b.x), __hadd(a.y, b.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) + __bfloat162float(b.x)), __float2bfloat16_rn(__bfloat162float(a.y) + __bfloat162float(b.y))};
+ #endif
+ }
+ 
+@@ -733,7 +733,7 @@ TL_DEVICE __nv_bfloat162 sub2(__nv_bfloat162 a, __nv_bfloat162 b) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __hsub2(a, b);
+ #else
+-  return __nv_bfloat162{__hsub(a.x, b.x), __hsub(a.y, b.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) - __bfloat162float(b.x)), __float2bfloat16_rn(__bfloat162float(a.y) - __bfloat162float(b.y))};
+ #endif
+ }
+ 
+@@ -761,7 +761,7 @@ TL_DEVICE __nv_bfloat162 mul2(__nv_bfloat162 a, __nv_bfloat162 b) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __hmul2(a, b);
+ #else
+-  return __nv_bfloat162{__hmul(a.x, b.x), __hmul(a.y, b.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) * __bfloat162float(b.x)), __float2bfloat16_rn(__bfloat162float(a.y) * __bfloat162float(b.y))};
+ #endif
+ }
+ 
+@@ -790,7 +790,7 @@ TL_DEVICE __nv_bfloat162 fma2(__nv_bfloat162 a, __nv_bfloat162 b,
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __hfma2(a, b, c);
+ #else
+-  return __nv_bfloat162{__hfma(a.x, b.x, c.x), __hfma(a.y, b.y, c.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) * __bfloat162float(b.x) + __bfloat162float(c.x)), __float2bfloat16_rn(__bfloat162float(a.y) * __bfloat162float(b.y) + __bfloat162float(c.y))};
+ #endif
+ }
+ 
+@@ -812,7 +812,7 @@ TL_DEVICE __nv_bfloat162 max2(__nv_bfloat162 a, __nv_bfloat162 b) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __hmax2(a, b);
+ #else
+-  return __nv_bfloat162{__hmax(a.x, b.x), __hmax(a.y, b.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(fmaxf(__bfloat162float(a.x), __bfloat162float(b.x))), __float2bfloat16_rn(fmaxf(__bfloat162float(a.y), __bfloat162float(b.y)))};
+ #endif
+ }
+ 
+@@ -834,7 +834,7 @@ TL_DEVICE __nv_bfloat162 min2(__nv_bfloat162 a, __nv_bfloat162 b) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __hmin2(a, b);
+ #else
+-  return __nv_bfloat162{__hmin(a.x, b.x), __hmin(a.y, b.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(fminf(__bfloat162float(a.x), __bfloat162float(b.x))), __float2bfloat16_rn(fminf(__bfloat162float(a.y), __bfloat162float(b.y)))};
+ #endif
+ }
+ 
+@@ -854,7 +854,7 @@ TL_DEVICE __nv_bfloat162 abs2(__nv_bfloat162 a) {
+ #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
+   return __habs2(a);
+ #else
+-  return __nv_bfloat162{__habs(a.x), __habs(a.y)};
++  return __nv_bfloat162{__float2bfloat16_rn(fabsf(__bfloat162float(a.x))), __float2bfloat16_rn(fabsf(__bfloat162float(a.y)))};
+ #endif
+ }
+ 
+diff --git a/src/tl_templates/cuda/reduce.h b/src/tl_templates/cuda/reduce.h
+index 1099b895..f35878de 100644
+--- a/src/tl_templates/cuda/reduce.h
++++ b/src/tl_templates/cuda/reduce.h
+@@ -38,7 +38,7 @@ struct MaxOp {
+   }
+ 
+   TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
+-    return bfloat16_t(__hmax(x.to_nv_bfloat16(), y.to_nv_bfloat16()));
++    return bfloat16_t(fmaxf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));
+   }
+ 
+   TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
+@@ -51,11 +51,15 @@ struct MaxOpNan {
+   }
+ 
+   TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
+-    return bfloat16_t(__hmax_nan(x.to_nv_bfloat16(), y.to_nv_bfloat16()));
++    return bfloat16_t(fmaxf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));
+   }
+ 
+   TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) || defined(__hmax_nan)
+     return half_t(__hmax_nan(x.to_half(), y.to_half()));
++#else
++    return half_t(__hmax(x.to_half(), y.to_half()));
++#endif
+   }
+ };
+ 
+@@ -66,7 +70,7 @@ struct MinOp {
+ 
+   TL_DEVICE cutlass::bfloat16_t operator()(bfloat16_t const &x,
+                                            bfloat16_t const &y) {
+-    return bfloat16_t(__hmin(x.to_nv_bfloat16(), y.to_nv_bfloat16()));
++    return bfloat16_t(fminf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));
+   }
+ 
+   TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
+@@ -80,11 +84,15 @@ struct MinOpNan {
+   }
+ 
+   TL_DEVICE bfloat16_t operator()(bfloat16_t const &x, bfloat16_t const &y) {
+-    return bfloat16_t(__hmin_nan(x.to_nv_bfloat16(), y.to_nv_bfloat16()));
++    return bfloat16_t(fminf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));
+   }
+ 
+   TL_DEVICE half_t operator()(half_t const &x, half_t const &y) {
++#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) || defined(__hmin_nan)
+     return half_t(__hmin_nan(x.to_half(), y.to_half()));
++#else
++    return half_t(__hmin(x.to_half(), y.to_half()));
++#endif
+   }
+ };
+ 

@@ -1,0 +1,29 @@
+diff --git a/src/arith/iter_affine_map.cc b/src/arith/iter_affine_map.cc
+index 3de431fb9..3de12391a 100644
+--- a/src/arith/iter_affine_map.cc
++++ b/src/arith/iter_affine_map.cc
+@@ -2570,13 +2570,19 @@ class InverseAffineIterMapTransformer {
+   void Visit_(const IterSumExpr& iter_map_expr) {
+     PrimExpr input = backprop_.at(iter_map_expr) - iter_map_expr->base;
+ 
+-    // Case 1: Propagate to the input node directly when the sum expression has only one components
+-    if (iter_map_expr->args.size() == 1) {
+-      const auto& source = iter_map_expr->args[0];
+-      ICHECK(analyzer_->CanProveEqual(abs(source->scale), 1));
++  // Case 1: Propagate to the input node directly when the sum expression has only one components
++  if (iter_map_expr->args.size() == 1) {
++    const auto& source = iter_map_expr->args[0];
++    if (analyzer_->CanProveEqual(abs(source->scale), 1)) {
+       backprop_.Set(source, (backprop_.at(source) + input) * source->scale);
+-      return;
++    } else {
++      // Scale != 1: divide by the scale (common for padded layouts where
++      // the i dimension is multiplied by a stride > 1).
++      ICHECK(analyzer_->CanProveGreaterEqual(source->scale, 1));
++      backprop_.Set(source, backprop_.at(source) + floordiv(input, source->scale));
+     }
++    return;
++  }
+ 
+     // Case 2: If the sum expression has multiple components, check the fuse pattern and then split
+     // the sum expression for each components.

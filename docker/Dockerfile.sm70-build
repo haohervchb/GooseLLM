@@ -53,34 +53,21 @@ RUN python3 -m pip install -r /tmp/requirements/cuda.txt --break-system-packages
 
 RUN python3 -m pip install 'setuptools>=77.0.3,<81.0.0' 'setuptools_scm>=8' grpcio-tools cmake build --break-system-packages
 
-# ── Build TileLang from source with SM70 bf16 patches ────────────────────
+# ── Build TileLang from source with SM70 patches ────────────────────────
 ARG TILELANG_REPO=https://github.com/tile-ai/tilelang.git
 ARG TILELANG_REF=main
 
+# Copy patches early so they're available before main COPY
+COPY patches /tmp/patches
+
 RUN git clone --branch ${TILELANG_REF} --depth 1 ${TILELANG_REPO} /opt/tilelang
 
-# Apply SM70 bf16 fallback patches (V100 has no native bf16 ALU)
-# common.h: replace __hadd/__hmul/__hmax/__hmin etc with float fallbacks
-RUN cd /opt/tilelang/src/tl_templates/cuda \
-    && sed -i 's/return __nv_bfloat162{__hadd(a.x, b.x), __hadd(a.y, b.y)};/return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) + __bfloat162float(b.x)), __float2bfloat16_rn(__bfloat162float(a.y) + __bfloat162float(b.y))};/' common.h \
-    && sed -i 's/return __nv_bfloat162{__hsub(a.x, b.x), __hsub(a.y, b.y)};/return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) - __bfloat162float(b.x)), __float2bfloat16_rn(__bfloat162float(a.y) - __bfloat162float(b.y))};/' common.h \
-    && sed -i 's/return __nv_bfloat162{__hmul(a.x, b.x), __hmul(a.y, b.y)};/return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) * __bfloat162float(b.x)), __float2bfloat16_rn(__bfloat162float(a.y) * __bfloat162float(b.y))};/' common.h \
-    && sed -i 's/return __nv_bfloat162{__hfma(a.x, b.x, c.x), __hfma(a.y, b.y, c.y)};/return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) * __bfloat162float(b.x) + __bfloat162float(c.x)), __float2bfloat16_rn(__bfloat162float(a.y) * __bfloat162float(b.y) + __bfloat162float(c.y))};/' common.h \
-    && sed -i 's/return __nv_bfloat162{__hmax(a.x, b.x), __hmax(a.y, b.y)};/return __nv_bfloat162{__float2bfloat16_rn(fmaxf(__bfloat162float(a.x), __bfloat162float(b.x))), __float2bfloat16_rn(fmaxf(__bfloat162float(a.y), __bfloat162float(b.y)))};/' common.h \
-    && sed -i 's/return __nv_bfloat162{__hmin(a.x, b.x), __hmin(a.y, b.y)};/return __nv_bfloat162{__float2bfloat16_rn(fminf(__bfloat162float(a.x), __bfloat162float(b.x))), __float2bfloat16_rn(fminf(__bfloat162float(a.y), __bfloat162float(b.y)))};/' common.h \
-    && sed -i 's/return __nv_bfloat162{__habs(a.x), __habs(a.y)};/return __nv_bfloat162{__float2bfloat16_rn(fabsf(__bfloat162float(a.x))), __float2bfloat16_rn(fabsf(__bfloat162float(a.y)))};/' common.h \
-    && sed -i 's/return bfloat16_t(__habs(x.to_nv_bfloat16()));/return bfloat16_t(fabsf(__bfloat162float(x.to_nv_bfloat16())));/' common.h
-
-# reduce.h: SM70 bf16 Max/MinOp fallbacks (no __hmax_nan/__hmin_nan on SM70)
-RUN cd /opt/tilelang/src/tl_templates/cuda \
-    && sed -i 's/return bfloat16_t(__hmax(x.to_nv_bfloat16(), y.to_nv_bfloat16()));/return bfloat16_t(fmaxf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));/' reduce.h \
-    && sed -i 's/return bfloat16_t(__hmax_nan(x.to_nv_bfloat16(), y.to_nv_bfloat16()));/return bfloat16_t(fmaxf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));/' reduce.h \
-    && sed -i 's/return bfloat16_t(__hmin(x.to_nv_bfloat16(), y.to_nv_bfloat16()));/return bfloat16_t(fminf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));/' reduce.h \
-    && sed -i 's/return bfloat16_t(__hmin_nan(x.to_nv_bfloat16(), y.to_nv_bfloat16()));/return bfloat16_t(fminf(__bfloat162float(x.to_nv_bfloat16()), __bfloat162float(y.to_nv_bfloat16())));/' reduce.h \
-    && sed -i '/return half_t(__hmax_nan(x.to_half(), y.to_half()));/i\#if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800) || defined(__hmax_nan)' \
-    && sed -i '/__hmax_nan/,/};/{ /return half_t(__hmax_nan/ a\#else\n    return half_t(__hmax(x.to_half(), y.to_half()));\n#endif }' reduce.h || true \
-    && (grep -q '__hmax_nan' reduce.h && sed -i 's/return half_t(__hmax_nan(x.to_half(), y.to_half()));/#if defined(__CUDA_ARCH__) \&\& (__CUDA_ARCH__ >= 800) || defined(__hmax_nan)\n    return half_t(__hmax_nan(x.to_half(), y.to_half()));\n#else\n    return half_t(__hmax(x.to_half(), y.to_half()));\n#endif/' reduce.h || true) \
-    && (grep -q '__hmin_nan' reduce.h && sed -i 's/return half_t(__hmin_nan(x.to_half(), y.to_half()));/#if defined(__CUDA_ARCH__) \&\& (__CUDA_ARCH__ >= 800) || defined(__hmin_nan)\n    return half_t(__hmin_nan(x.to_half(), y.to_half()));\n#else\n    return half_t(__hmin(x.to_half(), y.to_half()));\n#endif/' reduce.h || true)
+RUN cd /opt/tilelang \
+    && git apply /tmp/patches/tilelang-sm70-bf16.patch \
+    && git apply /tmp/patches/tilelang-nvcc-optlevel.patch \
+    && cd 3rdparty/tvm \
+    && git apply /tmp/patches/tilelang-tvm-padded-layout.patch \
+    && cd ../..
 
 RUN cd /opt/tilelang && python3 -m pip install -e . --break-system-packages
 
