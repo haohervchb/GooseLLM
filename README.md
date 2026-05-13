@@ -196,7 +196,7 @@ docker run --rm \
 ## Known Limitations
 
 - **MTP / DFlash** — not working yet.
-- **Concurrent requests** — running more than 1 concurrent request may produce degraded results.
+- **Concurrent requests** — more than 1 concurrent request is slow (single-kernel launch path needs optimization).
 - **Decode** — single-token decode falls back to Triton on TileLang backend (slower than FA-V100 backend's custom CUDA decode kernel).
 - **Gemma 4** — not supported yet.
 
