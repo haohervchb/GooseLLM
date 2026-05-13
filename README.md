@@ -79,10 +79,10 @@ Before running any of the commands below, make sure you're in the conda environm
 conda activate goosellm
 ```
 
-### MoE Model (Qwen3.6-35B-A3B-AWQ)
+### MoE Model (Qwen3.6-35B-A3B-AWQ / Qwen3.5-122B-A10B-AWQ)
 
 ```bash
-NCCL_P2P_LEVEL=NVL \
+FLA_USE_TILELANG=1 NCCL_P2P_LEVEL=NVL \
 python -m vllm.entrypoints.openai.api_server \
   --model QuantTrio/Qwen3.6-35B-A3B-AWQ \
   --tensor-parallel-size 4 \
@@ -93,6 +93,7 @@ python -m vllm.entrypoints.openai.api_server \
   --max-num-batched-tokens 16384 \
   --trust-remote-code \
   --attention-backend FLASH_ATTN_TILELANG_V100 \
+  --enable-expert-parallel \
   --skip-mm-profiling \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
   --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
@@ -103,7 +104,7 @@ python -m vllm.entrypoints.openai.api_server \
 ### Dense Model (Qwen3.6-27B-AWQ)
 
 ```bash
-NCCL_P2P_LEVEL=NVL \
+FLA_USE_TILELANG=1 NCCL_P2P_LEVEL=NVL \
 python -m vllm.entrypoints.openai.api_server \
   --model QuantTrio/Qwen3.6-27B-AWQ \
   --tensor-parallel-size 4 \
@@ -121,7 +122,7 @@ python -m vllm.entrypoints.openai.api_server \
   --port 8000
 ```
 
-### Docker MoE (Qwen3.6-35B-A3B-AWQ/ 122B)
+### Docker MoE (Qwen3.6-35B-A3B-AWQ / Qwen3.5-122B-A10B-AWQ)
 
 ```bash
 docker run --rm \
@@ -130,6 +131,7 @@ docker run --rm \
   -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e NCCL_P2P_LEVEL=NVL \
+  -e FLA_USE_TILELANG=1 \
   goosellm:sm70 \
   python -m vllm.entrypoints.openai.api_server \
     --model QuantTrio/Qwen3.6-35B-A3B-AWQ \
@@ -140,8 +142,10 @@ docker run --rm \
     --tensor-parallel-size 4 \
     --max-num-seqs 1 \
     --max-num-batched-tokens 16384 \
-    --skip-mm-profiling \
+    --trust-remote-code \
     --attention-backend FLASH_ATTN_TILELANG_V100 \
+    --enable-expert-parallel \
+    --skip-mm-profiling \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
     --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' 
 ```
@@ -155,6 +159,7 @@ docker run --rm \
   -p 8000:8000 \
   -v ~/.cache/huggingface:/root/.cache/huggingface \
   -e NCCL_P2P_LEVEL=NVL \
+  -e FLA_USE_TILELANG=1 \
   goosellm:sm70 \
   python -m vllm.entrypoints.openai.api_server \
     --model QuantTrio/Qwen3.6-27B-AWQ \
@@ -165,12 +170,11 @@ docker run --rm \
     --tensor-parallel-size 4 \
     --max-num-seqs 1 \
     --max-num-batched-tokens 16384 \
-    --skip-mm-profiling \
+    --trust-remote-code \
     --attention-backend FLASH_ATTN_TILELANG_V100 \
+    --skip-mm-profiling \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
-    --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
-    --host 0.0.0.0 \
-    --port 8000
+    --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}'
 ```
 
 ## Results
@@ -183,6 +187,7 @@ docker run --rm \
 
 | Variable | Default | Purpose |
 |----------|---------|---------|
+| `FLA_USE_TILELANG` | `0` | Set to `1` to enable TileLang-accelerated Flash Linear Attention kernels for Gated DeltaNet layers |
 | `VLLM_USE_SM70_DECODE` | `1` | Set to `0` to disable SM70 optimized decode kernel |
 | `VLLM_SM70_DECODE_VERBOSE` | `0` | Set to `1` for verbose build logs from SM70 decode extension |
 | `VLLM_DEBUG_CHECK_NAN` | `0` | Set to `1` to enable NaN/Inf checks in model runner hot path (device→host sync) |
