@@ -124,21 +124,31 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             torch.cuda.synchronize()
         causal = getattr(attn_metadata, "causal", True)
 
-        if not _diag_done and not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
-            logger.info(
-                "TILELANG prefill diag: scale=%.6f, q=%s, k_cache=%s, "
-                "block_table=%s, seq_lens=%s, query_start_loc=%s, "
-                "prefix_kv_lens=%s, num_kv_heads=%d, block_size=%d",
-                self.scale, list(query.shape), list(k_cache.shape),
-                list(block_table.shape), seq_lens.tolist()[:4],
-                query_start_loc.tolist()[:4], prefix_kv_lens.tolist()[:4],
-                key.shape[1], k_cache.shape[1],
-            )
+        # TileLang kernel requires page_block_size=16. Hybrid models (e.g.
+        # Qwen3.5-122B-A10B) may use larger block_size (1056) to align
+        # attention and Mamba page sizes. Reshape on the fly: each 1056-token
+        # page becomes 66 sub-pages of 16 tokens.
+        actual_block_size = k_cache.shape[1]
+        block_size = 16
+        if actual_block_size != block_size:
+            factor = actual_block_size // block_size
+            # Reshape K/V: [N, 1056, Hkv, D] -> [N*66, 16, Hkv, D]
+            k_cache = k_cache.reshape(-1, block_size, k_cache.shape[2],
+                                      k_cache.shape[3])
+            v_cache = v_cache.reshape(-1, block_size, v_cache.shape[2],
+                                      v_cache.shape[3])
+            # Expand block_table: [B, M] -> [B, M*66]
+            B, M = block_table.shape
+            arange = torch.arange(factor, device=block_table.device,
+                                  dtype=block_table.dtype)
+            block_table = (
+                block_table.unsqueeze(-1) * factor + arange
+            ).reshape(B, M * factor)
 
         _, softmax_lse = self.tilelang_paged(
             query, k_cache, v_cache, block_table, seq_lens,
             query_start_loc, prefix_kv_lens,
-            out=out_view, block_size=16,
+            out=out_view, block_size=block_size,
             softmax_scale=self.scale, causal=causal,
             num_kv_heads=key.shape[1],
         )
@@ -287,10 +297,6 @@ class FlashAttnTileLangV100Backend(TritonAttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         return [64, 128, 256]
-
-    @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int]:
-        return [16]
 
     @staticmethod
     def get_kv_cache_stride_order(include_num_layers_dimension=False):
