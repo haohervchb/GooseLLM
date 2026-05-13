@@ -119,9 +119,6 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             prefix_kv_lens = seq_lens - query_lens
             prefix_kv_lens = torch.clamp(prefix_kv_lens, min=0)
 
-        # Synchronize only outside CUDA graph capture
-        if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
-            torch.cuda.synchronize()
         causal = getattr(attn_metadata, "causal", True)
 
         # TileLang kernel requires page_block_size=16. Hybrid models (e.g.
