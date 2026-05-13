@@ -189,7 +189,9 @@ docker run --rm \
 
 ## Results
 
-![Comparison](tests/Comparison_QuantTrio_Qwen3.5-122B-A10B-AWQ_并发_1__vs_QuantTrio_Qwen3.6-27B-AWQ_QuantTrioQwen3.6-27B-AWQ_concurre.png)
+![Dense 27B vs MoE 35B throughput](tests/Comparison_QuantTrio_Qwen3.6-27B-AWQ_并发_1__vs_QuantTrio_Qwen3.6-35B-A3B-AWQ_QuantTrioQwen3.6-35B-A3B-AWQ_2_conc.png)
+
+![MoE 122B vs Dense 27B throughput](tests/Comparison_QuantTrio_Qwen3.5-122B-A10B-AWQ_并发_1__vs_Qwen_Qwen3.6-27B_QwenQwen3.6-27B_concurrency_262144_vs_Qwen.png)
 
 ## Environment Variables
 
