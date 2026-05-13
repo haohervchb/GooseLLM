@@ -1,5 +1,5 @@
 diff --git a/src/tl_templates/cuda/common.h b/src/tl_templates/cuda/common.h
-index eba25730..f8e2ef46 100644
+index 77ead12..f8e2ef4 100644
 --- a/src/tl_templates/cuda/common.h
 +++ b/src/tl_templates/cuda/common.h
 @@ -97,7 +97,7 @@ TL_PATCH TL_DEVICE half_t __habs(const half_t x) {
@@ -38,16 +38,20 @@ index eba25730..f8e2ef46 100644
  #endif
  }
  
-@@ -790,7 +790,7 @@ TL_DEVICE __nv_bfloat162 fma2(__nv_bfloat162 a, __nv_bfloat162 b,
+@@ -790,11 +790,7 @@ TL_DEVICE __nv_bfloat162 fma2(__nv_bfloat162 a, __nv_bfloat162 b,
  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
    return __hfma2(a, b, c);
  #else
--  return __nv_bfloat162{__hfma(a.x, b.x, c.x), __hfma(a.y, b.y, c.y)};
+-  float a_x = __bfloat162float(a.x), a_y = __bfloat162float(a.y);
+-  float b_x = __bfloat162float(b.x), b_y = __bfloat162float(b.y);
+-  float c_x = __bfloat162float(c.x), c_y = __bfloat162float(c.y);
+-  return __nv_bfloat162{__float2bfloat16(a_x * b_x + c_x),
+-                        __float2bfloat16(a_y * b_y + c_y)};
 +  return __nv_bfloat162{__float2bfloat16_rn(__bfloat162float(a.x) * __bfloat162float(b.x) + __bfloat162float(c.x)), __float2bfloat16_rn(__bfloat162float(a.y) * __bfloat162float(b.y) + __bfloat162float(c.y))};
  #endif
  }
  
-@@ -812,7 +812,7 @@ TL_DEVICE __nv_bfloat162 max2(__nv_bfloat162 a, __nv_bfloat162 b) {
+@@ -816,7 +812,7 @@ TL_DEVICE __nv_bfloat162 max2(__nv_bfloat162 a, __nv_bfloat162 b) {
  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
    return __hmax2(a, b);
  #else
@@ -56,7 +60,7 @@ index eba25730..f8e2ef46 100644
  #endif
  }
  
-@@ -834,7 +834,7 @@ TL_DEVICE __nv_bfloat162 min2(__nv_bfloat162 a, __nv_bfloat162 b) {
+@@ -838,7 +834,7 @@ TL_DEVICE __nv_bfloat162 min2(__nv_bfloat162 a, __nv_bfloat162 b) {
  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
    return __hmin2(a, b);
  #else
@@ -65,7 +69,7 @@ index eba25730..f8e2ef46 100644
  #endif
  }
  
-@@ -854,7 +854,7 @@ TL_DEVICE __nv_bfloat162 abs2(__nv_bfloat162 a) {
+@@ -858,7 +854,7 @@ TL_DEVICE __nv_bfloat162 abs2(__nv_bfloat162 a) {
  #if defined(__CUDA_ARCH__) && (__CUDA_ARCH__ >= 800)
    return __habs2(a);
  #else
@@ -75,7 +79,7 @@ index eba25730..f8e2ef46 100644
  }
  
 diff --git a/src/tl_templates/cuda/reduce.h b/src/tl_templates/cuda/reduce.h
-index 1099b895..f35878de 100644
+index 1099b89..f35878d 100644
 --- a/src/tl_templates/cuda/reduce.h
 +++ b/src/tl_templates/cuda/reduce.h
 @@ -38,7 +38,7 @@ struct MaxOp {

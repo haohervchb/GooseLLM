@@ -1,5 +1,5 @@
 diff --git a/tilelang/contrib/nvcc.py b/tilelang/contrib/nvcc.py
-index 7df972d2..4cf309e3 100644
+index 7df972d..4cf309e 100644
 --- a/tilelang/contrib/nvcc.py
 +++ b/tilelang/contrib/nvcc.py
 @@ -94,7 +94,8 @@ def compile_cuda(code, target_format="ptx", arch=None, options=None, path_target
