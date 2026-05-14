@@ -106,7 +106,7 @@ python -m vllm.entrypoints.openai.api_server \
   --enable-expert-parallel \
   --skip-mm-profiling \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise"}' \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -127,7 +127,7 @@ python -m vllm.entrypoints.openai.api_server \
   --attention-backend FLASH_ATTN_TILELANG_V100 \
   --skip-mm-profiling \
   --limit-mm-per-prompt '{"image":0,"video":0}' \
-  --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' \
+  --compilation-config '{"cudagraph_mode":"full_and_piecewise"}' \
   --host 0.0.0.0 \
   --port 8000
 ```
@@ -157,7 +157,7 @@ docker run --rm \
     --enable-expert-parallel \
     --skip-mm-profiling \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
-    --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}' 
+    --compilation-config '{"cudagraph_mode":"full_and_piecewise"}' 
 ```
 
 ### Docker Dense (Qwen3.6-27B-AWQ)
@@ -184,7 +184,7 @@ docker run --rm \
     --attention-backend FLASH_ATTN_TILELANG_V100 \
     --skip-mm-profiling \
     --limit-mm-per-prompt '{"image":0,"video":0}' \
-    --compilation-config '{"cudagraph_mode":"full_and_piecewise","cudagraph_capture_sizes":[1]}'
+    --compilation-config '{"cudagraph_mode":"full_and_piecewise"}'
 ```
 
 ## Results
