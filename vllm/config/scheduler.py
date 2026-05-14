@@ -226,10 +226,17 @@ class SchedulerConfig:
                 self.max_num_batched_tokens,
             )
 
-        if self.max_num_partial_prefills > 1:
-            if self.long_prefill_token_threshold == 0:
-                self.long_prefill_token_threshold = int(max_model_len * 0.04)
+        if self.enable_chunked_prefill and self.long_prefill_token_threshold == 0:
+            self.long_prefill_token_threshold = int(max_model_len * 0.04)
 
+            logger.info(
+                "Chunked prefill enabled with "
+                "max_num_batched_tokens=%d, "
+                "long_prefill_token_threshold=%d",
+                self.max_num_batched_tokens,
+                self.long_prefill_token_threshold,
+            )
+        if self.max_num_partial_prefills > 1:
             logger.info(
                 "Concurrent partial prefills enabled with "
                 "max_num_partial_prefills=%d, max_long_partial_prefills=%d, "

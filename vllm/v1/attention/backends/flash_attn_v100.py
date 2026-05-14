@@ -496,11 +496,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         block_size = k_cache.shape[1]
         softmax_scale = self.scale
 
-        # Barrier: ensure do_kv_cache_update completes before paged kernel reads
-        # from the KV cache. Without this, torch.compile may reorder the Triton
-        # reshape_and_cache write and the CUDA paged_fwd read, causing token 0
-        # to read stale/uninitialized cache data (produces NaN with block_size>16).
-        torch.cuda.synchronize()
+        # KV cache update and paged attention both run on the default stream,
+        # so stream ordering guarantees the write completes before the read.
 
         # Call paged kernel with native GQA support.
         # K/V cache keep their original num_kv_heads; kernel computes kv_head_id internally.
