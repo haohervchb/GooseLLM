@@ -123,10 +123,28 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             torch.cuda.synchronize()
         causal = getattr(attn_metadata, "causal", True)
 
+        # TileLang kernel requires page_block_size=16. Hybrid models (e.g.
+        # Qwen3.5-122B-A10B) may use larger block_size (1056) to align
+        # attention and Mamba page sizes. Reshape on the fly.
+        actual_block_size = k_cache.shape[1]
+        block_size = 16
+        if actual_block_size != block_size:
+            factor = actual_block_size // block_size
+            k_cache = k_cache.reshape(-1, block_size, k_cache.shape[2],
+                                      k_cache.shape[3])
+            v_cache = v_cache.reshape(-1, block_size, v_cache.shape[2],
+                                      v_cache.shape[3])
+            B, M = block_table.shape
+            arange = torch.arange(factor, device=block_table.device,
+                                  dtype=block_table.dtype)
+            block_table = (
+                block_table.unsqueeze(-1) * factor + arange
+            ).reshape(B, M * factor)
+
         _, softmax_lse = self.tilelang_paged(
             query, k_cache, v_cache, block_table, seq_lens,
             query_start_loc, prefix_kv_lens,
-            out=out_view, block_size=k_cache.shape[1],
+            out=out_view, block_size=block_size,
             softmax_scale=self.scale, causal=causal,
             num_kv_heads=key.shape[1],
         )
