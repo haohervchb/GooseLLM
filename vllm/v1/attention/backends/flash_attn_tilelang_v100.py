@@ -287,12 +287,13 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: GEMV kernel for hd=256 (SIMT FMA, no MMA), Triton otherwise
-        if query.shape[-1] == 256 and self.tilelang_gemv_decode is not None:
+        # Decode: TileLang MMA kernel for hd=256 (block_N=16, L1-resident),
+        # Triton fallback for hd=64,128.
+        if query.shape[-1] == 256 and self.use_tilelang_paged:
             if not _logged_decode and not is_capturing:
-                logger.info("FLASH_ATTN_TILELANG_V100 GEMV decode path active (hd=256).")
+                logger.info("FLASH_ATTN_TILELANG_V100 MMA decode path active (hd=256).")
                 _logged_decode = True
-            return self._tilelang_gemv_decode(
+            return self._tilelang_decode(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
         return super().forward(layer, query, key, value, kv_cache,
