@@ -200,7 +200,13 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def _tilelang_gemv_decode(self, layer, query, key, value, kv_cache,
                                attn_metadata, output):
-        """Decode: CUDA GEMV kernel (SIMT FMA + warp shuffle, graph-capturable)."""
+        """Decode: CUDA GEMV kernel (SIMT FMA + warp shuffle)."""
+        return self._gemv_decode_impl(
+            layer, query, key, value, kv_cache, attn_metadata, output)
+
+    @torch.compiler.disable(recursive=False)
+    def _gemv_decode_impl(self, layer, query, key, value, kv_cache,
+                           attn_metadata, output):
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query_flat = query[:num_actual_tokens]
