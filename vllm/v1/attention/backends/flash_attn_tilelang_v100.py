@@ -54,7 +54,7 @@ _logged_decode = False
 
 
 def _get_tilelang_ops():
-    global _tilelang_paged_forward, _tilelang_decode_forward
+    global _tilelang_paged_forward, _tilelang_decode_forward, _tilelang_gemv_decode_forward
     if _tilelang_paged_forward is None or _tilelang_decode_forward is None:
         try:
             import tilelang_fa_v100
@@ -62,9 +62,14 @@ def _get_tilelang_ops():
                 _tilelang_paged_forward = getattr(tilelang_fa_v100, "tilelang_paged_forward", None)
             if _tilelang_decode_forward is None:
                 _tilelang_decode_forward = getattr(tilelang_fa_v100, "tilelang_decode_forward", None)
+            if _tilelang_gemv_decode_forward is None:
+                _tilelang_gemv_decode_forward = getattr(tilelang_fa_v100, "tilelang_gemv_decode_forward", None)
         except ImportError:
             pass
     return _tilelang_paged_forward, _tilelang_decode_forward
+
+
+_tilelang_gemv_decode_forward = None
 
 
 class FlashAttnTileLangV100Impl(TritonAttentionImpl):
@@ -73,6 +78,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.tilelang_paged, self.tilelang_decode = _get_tilelang_ops()
+        self.tilelang_gemv_decode = _tilelang_gemv_decode_forward
         self.use_tilelang_paged = self.tilelang_paged is not None
         self._tilelang_paged_ready = False
 
@@ -192,6 +198,54 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             )
         return output
 
+    def _tilelang_gemv_decode(self, layer, query, key, value, kv_cache,
+                               attn_metadata, output):
+        """Decode: TileLang GEMV (block_N=16, SIMT FMA, no tensor cores)."""
+        is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
+
+        if not is_capturing:
+            if kv_cache.numel() == 0:
+                return output.fill_(0)
+            if attn_metadata.seq_lens.max().item() == 0:
+                return output.fill_(0)
+
+        query_flat = query[:attn_metadata.num_actual_tokens]
+        key_cache, value_cache = kv_cache.unbind(1)
+        k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
+        v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
+
+        actual_block_size = k_cache.shape[1]
+        block_size = 16
+        block_table = attn_metadata.block_table
+        if actual_block_size != block_size:
+            factor = actual_block_size // block_size
+            k_cache = k_cache.reshape(-1, block_size, k_cache.shape[2],
+                                      k_cache.shape[3])
+            v_cache = v_cache.reshape(-1, block_size, v_cache.shape[2],
+                                      v_cache.shape[3])
+            B, M = block_table.shape
+            arange = torch.arange(factor, device=block_table.device,
+                                  dtype=block_table.dtype)
+            block_table = (
+                block_table.unsqueeze(-1) * factor + arange
+            ).reshape(B, M * factor)
+
+        result = self.tilelang_gemv_decode(
+            query_flat, k_cache, v_cache, block_table, attn_metadata.seq_lens,
+            block_size=block_size,
+            num_kv_heads=key.shape[1],
+            softmax_scale=self.scale,
+        )
+        output[:attn_metadata.num_actual_tokens].copy_(result)
+
+        if not is_capturing and torch.isnan(output).any():
+            logger.warning("FLASH_ATTN_TILELANG_V100 GEMV decode NaN, falling back to Triton.")
+            return TritonAttentionImpl.forward(
+                self, layer, query, key, value, kv_cache,
+                attn_metadata, output,
+            )
+        return output
+
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
         global _warned_missing, _warned_prefill, _logged_prefill, _logged_decode
@@ -233,7 +287,14 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: Triton (faster than tilelang decode which wastes 15/16 MMA on padded rows)
+        # Decode: GEMV kernel for hd=256 (SIMT FMA, no MMA), Triton otherwise
+        if query.shape[-1] == 256 and self.tilelang_gemv_decode is not None:
+            if not _logged_decode and not is_capturing:
+                logger.info("FLASH_ATTN_TILELANG_V100 GEMV decode path active (hd=256).")
+                _logged_decode = True
+            return self._tilelang_gemv_decode(
+                layer, query, key, value, kv_cache, attn_metadata, output)
+
         return super().forward(layer, query, key, value, kv_cache,
                                attn_metadata, output, output_scale, output_block_scale)
 
