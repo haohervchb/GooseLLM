@@ -200,7 +200,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def _tilelang_gemv_decode(self, layer, query, key, value, kv_cache,
                                attn_metadata, output):
-        """Decode: TileLang GEMV (block_N=16, SIMT FMA, no tensor cores)."""
+        """Decode: CUDA GEMV kernel (SIMT FMA + warp shuffle, zero tensor cores)."""
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
         if not is_capturing:
@@ -209,7 +209,8 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             if attn_metadata.seq_lens.max().item() == 0:
                 return output.fill_(0)
 
-        query_flat = query[:attn_metadata.num_actual_tokens]
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query_flat = query[:num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(1)
         k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
         v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
@@ -230,21 +231,32 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                 block_table.unsqueeze(-1) * factor + arange
             ).reshape(B, M * factor)
 
-        result = self.tilelang_gemv_decode(
-            query_flat, k_cache, v_cache, block_table, attn_metadata.seq_lens,
-            block_size=block_size,
-            num_kv_heads=key.shape[1],
-            softmax_scale=self.scale,
-        )
-        output[:attn_metadata.num_actual_tokens].copy_(result)
-
-        if not is_capturing and torch.isnan(output).any():
-            logger.warning("FLASH_ATTN_TILELANG_V100 GEMV decode NaN, falling back to Triton.")
-            return TritonAttentionImpl.forward(
-                self, layer, query, key, value, kv_cache,
-                attn_metadata, output,
+        try:
+            from vllm.v1.attention.ops.gemv_decode import (
+                ensure_gemv_paged_decode_available,
+                gemv_paged_decode_attention,
             )
-        return output
+            ensure_gemv_paged_decode_available()
+            gemv_paged_decode_attention(
+                output=output[:num_actual_tokens],
+                query=query_flat,
+                key_cache=k_cache,
+                value_cache=v_cache,
+                num_kv_heads=key.shape[1],
+                scale=self.scale,
+                block_tables=block_table,
+                seq_lens=attn_metadata.seq_lens,
+                block_size=k_cache.shape[1],
+                num_pages=k_cache.shape[0],
+            )
+            return output
+        except Exception as exc:
+            logger.warning(
+                "FLASH_ATTN_TILELANG_V100 CUDA GEMV decode failed (%s), "
+                "falling back to Triton.", exc)
+
+        return super().forward(layer, query, key, value, kv_cache,
+                               attn_metadata, output, output_scale, output_block_scale)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
@@ -287,11 +299,11 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: GEMV kernel for hd=256 (tree-reduction, zero tensor cores),
+        # Decode: CUDA GEMV kernel for hd=256 (SIMT FMA + warp shuffle),
         # Triton fallback for hd=64,128.
-        if query.shape[-1] == 256 and self.tilelang_gemv_decode is not None:
+        if query.shape[-1] == 256:
             if not _logged_decode and not is_capturing:
-                logger.info("FLASH_ATTN_TILELANG_V100 GEMV decode path active (hd=256).")
+                logger.info("FLASH_ATTN_TILELANG_V100 CUDA GEMV decode path active (hd=256).")
                 _logged_decode = True
             return self._tilelang_gemv_decode(
                 layer, query, key, value, kv_cache, attn_metadata, output)
