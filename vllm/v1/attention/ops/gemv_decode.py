@@ -1,5 +1,4 @@
-# SPDX-License-Identifier: Apache-2-2.0
-# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# SPDX-License-Identifier: Apache-2.0
 
 from __future__ import annotations
 
@@ -11,11 +10,6 @@ import torch
 from filelock import FileLock
 
 from vllm.logger import init_logger
-from vllm.platforms import current_platform
-
-if current_platform.is_cuda_alike():
-    from vllm import _custom_ops as ops
-
 
 _ROOT_DIR = Path(__file__).resolve().parents[4]
 _EXT_NAME = "vllm_gemv_decode_ext"
@@ -23,13 +17,6 @@ _BUILD_DIR = _ROOT_DIR / ".cache" / _EXT_NAME
 _LOCK_PATH = _BUILD_DIR / ".build.lock"
 
 logger = init_logger(__name__)
-_logged_first_decode_call = False
-
-
-def _has_builtin_op() -> bool:
-    return current_platform.is_cuda_alike() and hasattr(
-        ops, "gemv_paged_decode_attention"
-    )
 
 
 @lru_cache(maxsize=1)
@@ -44,10 +31,7 @@ def _load_standalone_ext():
         str(_ROOT_DIR / "csrc/attention/gemv_decode.cu"),
     ]
 
-    extra_include_paths = [
-        str(_ROOT_DIR),
-        str(_ROOT_DIR / "csrc"),
-    ]
+    extra_include_paths = [str(_ROOT_DIR / "csrc")]
 
     extra_cflags = ["-O3"]
     extra_cuda_cflags = [
@@ -69,19 +53,28 @@ def _load_standalone_ext():
             )
         except Exception as exc:
             raise RuntimeError(
-                "Failed to build/load standalone GEMV decode extension. "
+                "Failed to build/load GEMV decode extension. "
                 "Set VLLM_GEMV_DECODE_VERBOSE=1 for compile logs."
             ) from exc
 
 
-def ensure_gemv_paged_decode_available() -> None:
-    if _has_builtin_op():
-        return
-    _load_standalone_ext()
+class GemvDecodeOp(torch.autograd.Function):
+    """Autograd wrapper — makes pybind11 kernel graph-capturable."""
 
+    @staticmethod
+    def forward(ctx, output, query, key_cache, value_cache, num_kv_heads,
+                scale, block_tables, seq_lens, block_size, num_pages):
+        ext = _load_standalone_ext()
+        ext.gemv_paged_decode_attention(
+            output, query, key_cache, value_cache,
+            num_kv_heads, scale, block_tables, seq_lens,
+            block_size, num_pages,
+        )
+        return output
 
-def get_gemv_decode_impl_label() -> str:
-    return "builtin" if _has_builtin_op() else "standalone"
+    @staticmethod
+    def backward(ctx, *grad_output):
+        return (None,) * 10
 
 
 def gemv_paged_decode_attention(
@@ -96,33 +89,8 @@ def gemv_paged_decode_attention(
     block_size: int,
     num_pages: int,
 ) -> None:
-    global _logged_first_decode_call
-    if _has_builtin_op():
-        impl = ops.gemv_paged_decode_attention
-    else:
-        impl = _load_standalone_ext().gemv_paged_decode_attention
-
-    if not _logged_first_decode_call:
-        logger.info_once(
-            "Invoking GEMV decode kernel: query=%s key_cache=%s "
-            "value_cache=%s block_size=%d num_pages=%d",
-            tuple(query.shape),
-            tuple(key_cache.shape),
-            tuple(value_cache.shape),
-            block_size,
-            num_pages,
-        )
-        _logged_first_decode_call = True
-
-    impl(
-        output,
-        query,
-        key_cache,
-        value_cache,
-        num_kv_heads,
-        scale,
-        block_tables,
-        seq_lens,
-        block_size,
-        num_pages,
+    GemvDecodeOp.apply(
+        output, query, key_cache, value_cache,
+        num_kv_heads, scale, block_tables, seq_lens,
+        block_size, num_pages,
     )
