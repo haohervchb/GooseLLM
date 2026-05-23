@@ -256,6 +256,21 @@ int64_t sm70_gemm_import_cache(torch::Tensor device_hint,
 int64_t sm70_gemm_export_cache(torch::Tensor device_hint,
                                const std::string& path);
 
+#ifndef GEMV_DECODE_ATTENTION_DECLARED
+#define GEMV_DECODE_ATTENTION_DECLARED
+void gemv_paged_decode_attention(
+    torch::Tensor& out,
+    torch::Tensor& query,
+    torch::Tensor& key_cache,
+    torch::Tensor& value_cache,
+    int64_t num_kv_heads,
+    double scale,
+    torch::Tensor& block_tables,
+    torch::Tensor& seq_lens,
+    int64_t block_size,
+    int64_t num_pages);
+#endif
+
 std::vector<torch::Tensor> awq_moe_build_strided_ptrs(
     torch::Tensor tm_weights,
     torch::Tensor tm_scales,

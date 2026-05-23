@@ -290,6 +290,15 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.def("sm70_gemm_export_cache(Tensor device_hint, str path) -> int");
   ops.impl("sm70_gemm_export_cache", torch::kCUDA, &sm70_gemm_export_cache);
 
+  // GEMV paged decode kernel for V100/SM70
+  ops.def(
+      "gemv_paged_decode_attention(Tensor out, Tensor query, "
+      "Tensor key_cache, Tensor value_cache, int num_kv_heads, "
+      "float scale, Tensor block_tables, Tensor seq_lens, "
+      "int block_size, int num_pages) -> ()");
+  ops.impl("gemv_paged_decode_attention", torch::kCUDA,
+           &gemv_paged_decode_attention);
+
   ops.def(
       "awq_moe_build_strided_ptrs(Tensor tm_weights, Tensor tm_scales, "
       "int k_ld, int q_ld, int num_experts) -> Tensor[]");

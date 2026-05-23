@@ -1,32 +1,24 @@
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
 #include <torch/all.h>
-
 #include <cuda_fp16.h>
+#include <cstdint>
+#include <cmath>
 
 namespace vllm {
-
 namespace {
 
-template <typename T>
-__device__ __forceinline__ T ceil_div(T a, T b) {
-  return (a + b - 1) / b;
-}
-
-template <int HEAD_SIZE, int BLOCK_SIZE, int CTA_H>
-__global__ void gemv_paged_decode_kernel_fp16(
+__global__ void gemv_decode_kernel(
     half* __restrict__ out,
     const half* __restrict__ query,
     const half* __restrict__ key_cache,
     const half* __restrict__ value_cache,
     int64_t num_heads,
     int64_t num_kv_heads,
-    int64_t num_queries_per_kv,
-    int64_t q_groups_per_kv,
     float scale,
     const int* __restrict__ block_tables,
     const int* __restrict__ seq_lens,
-    int64_t max_num_blocks_per_seq,
+    int64_t max_blocks_per_seq,
     int64_t block_size,
     int64_t num_pages,
     int64_t q_stride_0,
@@ -41,176 +33,124 @@ __global__ void gemv_paged_decode_kernel_fp16(
     int64_t v_stride_1,
     int64_t v_stride_2,
     int64_t v_stride_3) {
-  static_assert(BLOCK_SIZE == 16 || BLOCK_SIZE == 32 || BLOCK_SIZE == 64 || BLOCK_SIZE == 128,
-                "Supported block sizes are 16, 32, 64, and 128");
-  static_assert(CTA_H >= 1 && CTA_H <= 4, "CTA_H must be in [1, 4]");
 
-  constexpr int WARP = 32;
-  constexpr int NUM_THREADS = CTA_H * WARP;
-  constexpr int ROWS_PER_THREAD = (HEAD_SIZE + WARP - 1) / WARP;
-  constexpr int THREAD_GROUP_SIZE = BLOCK_SIZE <= 32 ? (WARP / BLOCK_SIZE) : 1;
+  int head_idx = blockIdx.x;
+  int seq_idx = blockIdx.y;
+  int lane = threadIdx.x;
 
-  const int seq_idx = blockIdx.y;
-  const int cta_idx = blockIdx.x;
-  const int warp_idx = threadIdx.x / WARP;
-  const int lane = threadIdx.x % WARP;
+  if (head_idx >= num_heads) return;
 
-  const int seq_len = seq_lens[seq_idx];
+  int seq_len = seq_lens[seq_idx];
+  half* out_ptr = out + seq_idx * out_stride_0 + head_idx * out_stride_1;
+
   if (seq_len <= 0) {
+    // Zero out for empty sequences
+    for (int d = lane; d < 256; d += 32) out_ptr[d] = __float2half(0.0f);
     return;
   }
 
-  const int kv_head_idx = cta_idx / q_groups_per_kv;
-  const int q_group_idx = cta_idx % q_groups_per_kv;
-  const int q_head_idx = kv_head_idx * num_queries_per_kv + q_group_idx * CTA_H + warp_idx;
-  const bool q_head_valid = (warp_idx < CTA_H) && (q_head_idx < num_heads);
+  int kv_head = head_idx / (num_heads / num_kv_heads);
+  const half* q_ptr = query + seq_idx * q_stride_0 + head_idx * q_stride_1;
 
-  extern __shared__ char smem_raw[];
-  half* q_tile = reinterpret_cast<half*>(smem_raw);
-  half* k_tile = q_tile + CTA_H * HEAD_SIZE;
-  half* v_tile = k_tile + BLOCK_SIZE * HEAD_SIZE;
-  float* probs = reinterpret_cast<float*>(v_tile + BLOCK_SIZE * HEAD_SIZE);
-  float* alpha_tile = probs + CTA_H * BLOCK_SIZE;
-  float* m_tile = alpha_tile + CTA_H;
-  float* l_tile = m_tile + CTA_H;
-
-  if (q_head_valid) {
-    const half* q_ptr = query + seq_idx * q_stride_0 + q_head_idx * q_stride_1;
-    for (int d = lane; d < HEAD_SIZE; d += WARP) {
-      q_tile[warp_idx * HEAD_SIZE + d] = q_ptr[d];
-    }
-  }
-  __syncthreads();
-
+  // Accumulators — each lane handles 8 output dims (256/32)
+  float acc[8];
+  for (int i = 0; i < 8; i++) acc[i] = 0.0f;
   float m = -INFINITY;
   float l = 0.0f;
-  float acc[ROWS_PER_THREAD];
+
+  const int* bt_row = block_tables + seq_idx * max_blocks_per_seq;
+  int num_blocks = (seq_len + block_size - 1) / block_size;
+  if (num_blocks > max_blocks_per_seq) num_blocks = max_blocks_per_seq;
+
+  for (int blk = 0; blk < num_blocks; blk++) {
+    int phys = bt_row[blk];
+    bool valid = (phys >= 0 && phys < num_pages);
+    int token_start = blk * block_size;
+    int tokens = (block_size < seq_len - token_start) ? block_size : (seq_len - token_start);
+
+    // ── QK^T: warp-shuffle dot products ──
+    float scores[16];
+    float max_score = -INFINITY;
+
+    for (int t = 0; t < tokens; t++) {
+      // Each lane computes partial dot product
+      float dot = 0.0f;
+      if (valid) {
+        int64_t k_base = (int64_t)phys * k_stride_0 + (int64_t)kv_head * k_stride_2;
+        const half* k_ptr = key_cache + k_base + t * k_stride_1;
+        for (int d = lane; d < 256; d += 32) {
+          dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d * k_stride_3]);
+        }
+      }
+      // Warp shuffle sum
 #pragma unroll
-  for (int i = 0; i < ROWS_PER_THREAD; ++i) {
-    acc[i] = 0.0f;
-  }
-
-  const int raw_num_seq_blocks = static_cast<int>(ceil_div(seq_len, static_cast<int>(block_size)));
-  const int num_seq_blocks = min(raw_num_seq_blocks, static_cast<int>(max_num_blocks_per_seq));
-  if (num_seq_blocks <= 0) return;
-  const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
-
-  for (int logical_block_idx = 0; logical_block_idx < num_seq_blocks; ++logical_block_idx) {
-    const int physical_block_idx = block_table[logical_block_idx];
-    const bool block_valid = (physical_block_idx >= 0 && physical_block_idx < num_pages);
-    const int token_start = logical_block_idx * static_cast<int>(block_size);
-    const int tokens_in_block = min(static_cast<int>(block_size), seq_len - token_start);
-    const int tile_elems = BLOCK_SIZE * HEAD_SIZE;
-
-    if (block_valid) {
-      const int64_t k_base = physical_block_idx * k_stride_0 + kv_head_idx * k_stride_2;
-      const int64_t v_base = physical_block_idx * v_stride_0 + kv_head_idx * v_stride_2;
-
-      for (int idx = threadIdx.x; idx < tile_elems; idx += NUM_THREADS) {
-        const int token_in_block = idx / HEAD_SIZE;
-        const int dim = idx % HEAD_SIZE;
-        if (token_in_block < tokens_in_block) {
-          const int64_t k_off = k_base + token_in_block * k_stride_1 + dim * k_stride_3;
-          const int64_t v_off = v_base + token_in_block * v_stride_1 + dim * v_stride_3;
-          k_tile[idx] = __ldcs(&key_cache[k_off]);
-          v_tile[idx] = __ldcs(&value_cache[v_off]);
-        } else {
-          k_tile[idx] = __float2half(0.0f);
-          v_tile[idx] = __float2half(0.0f);
-        }
+      for (int mask = 16; mask >= 1; mask /= 2) {
+        dot += __shfl_xor_sync(0xffffffff, dot, mask);
       }
-    } else {
-      for (int idx = threadIdx.x; idx < tile_elems; idx += NUM_THREADS) {
-        k_tile[idx] = __float2half(0.0f);
-        v_tile[idx] = __float2half(0.0f);
-      }
-    }
-    __syncthreads();
-
-    if (q_head_valid) {
-      const int token_lane = lane / THREAD_GROUP_SIZE;
-      const int group_offset = lane % THREAD_GROUP_SIZE;
-
-      float score = -INFINITY;
-      if (token_lane < tokens_in_block) {
-        const half* q_ptr = q_tile + warp_idx * HEAD_SIZE;
-        const half* k_ptr = k_tile + token_lane * HEAD_SIZE;
-        float partial = 0.0f;
-        for (int d = group_offset; d < HEAD_SIZE; d += THREAD_GROUP_SIZE) {
-          partial += __half2float(q_ptr[d]) * __half2float(k_ptr[d]);
-        }
-#pragma unroll
-        for (int mask = THREAD_GROUP_SIZE / 2; mask >= 1; mask /= 2) {
-          partial += __shfl_xor_sync(0xffffffff, partial, mask);
-        }
-        if (group_offset == 0) {
-          score = partial * scale;
-          probs[warp_idx * BLOCK_SIZE + token_lane] = score;
-        }
-      }
-
-      __syncwarp();
-
       if (lane == 0) {
-        float new_m = m;
-        for (int t = 0; t < tokens_in_block; ++t) {
-          new_m = fmaxf(new_m, probs[warp_idx * BLOCK_SIZE + t]);
-        }
-
-        const float alpha = (m == -INFINITY) ? 0.0f : expf(m - new_m);
-        float tile_sum = 0.0f;
-        for (int t = 0; t < tokens_in_block; ++t) {
-          float p = expf(probs[warp_idx * BLOCK_SIZE + t] - new_m);
-          probs[warp_idx * BLOCK_SIZE + t] = p;
-          tile_sum += p;
-        }
-
-        alpha_tile[warp_idx] = alpha;
-        m_tile[warp_idx] = new_m;
-        l_tile[warp_idx] = l * alpha + tile_sum;
-      }
-
-      __syncwarp();
-
-      const float alpha = alpha_tile[warp_idx];
-      m = m_tile[warp_idx];
-      l = l_tile[warp_idx];
-
-#pragma unroll
-      for (int row = 0; row < ROWS_PER_THREAD; ++row) {
-        const int dim = lane + row * WARP;
-        if (dim < HEAD_SIZE) {
-          float value = acc[row] * alpha;
-#pragma unroll
-          for (int t = 0; t < BLOCK_SIZE; ++t) {
-            if (t < tokens_in_block) {
-              value += probs[warp_idx * BLOCK_SIZE + t]
-                       * __half2float(v_tile[t * HEAD_SIZE + dim]);
-            }
-          }
-          acc[row] = value;
-        }
+        scores[t] = dot * scale;
+        if (scores[t] > max_score) max_score = scores[t];
       }
     }
 
-    __syncthreads();
+    // ── Online softmax (lane 0 only) ──
+    float old_m = m;
+    float new_m = fmaxf(old_m, max_score);
+    float sf = (old_m == -INFINITY) ? 0.0f : __expf(old_m - new_m);
+    float tile_sum = 0.0f;
+    float probs[16];
+
+    if (lane == 0) {
+      for (int t = 0; t < tokens; t++) {
+        float p = __expf(scores[t] - new_m);
+        probs[t] = p;
+        tile_sum += p;
+      }
+    }
+
+    // Broadcast probs and state to all lanes via shared memory trick: using sf register
+    // Lane 0 writes, other lanes read via __shfl_sync
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      probs[t] = __shfl_sync(0xffffffff, probs[t], 0);
+    }
+    tile_sum = __shfl_sync(0xffffffff, tile_sum, 0);
+    new_m = __shfl_sync(0xffffffff, new_m, 0);
+    sf = __shfl_sync(0xffffffff, sf, 0);
+
+    m = new_m;
+    // Rescale accumulator
+    for (int i = 0; i < 8; i++) acc[i] *= sf;
+    l = l * sf + tile_sum;
+
+    // ── PV: weighted sum ──
+    for (int t = 0; t < tokens; t++) {
+      if (valid) {
+        int64_t v_base = (int64_t)phys * v_stride_0 + (int64_t)kv_head * v_stride_2;
+        const half* v_ptr = value_cache + v_base + t * v_stride_1;
+        for (int i = 0; i < 8; i++) {
+          int d = lane + i * 32;
+          if (d < 256) {
+            acc[i] += probs[t] * __half2float(v_ptr[d * v_stride_3]);
+          }
+        }
+      }
+    }
   }
 
-  if (q_head_valid) {
-    const float inv_l = 1.0f / (l + 1e-6f);
-    half* out_ptr = out + seq_idx * out_stride_0 + q_head_idx * out_stride_1;
-#pragma unroll
-    for (int row = 0; row < ROWS_PER_THREAD; ++row) {
-      const int dim = lane + row * WARP;
-      if (dim < HEAD_SIZE) {
-        out_ptr[dim] = __float2half(acc[row] * inv_l);
+  // ── Output ──
+  if (l > 0.0f) {
+    float inv_l = 1.0f / (l + 1e-6f);
+    for (int i = 0; i < 8; i++) {
+      int d = lane + i * 32;
+      if (d < 256) {
+        out_ptr[d] = __float2half(acc[i] * inv_l);
       }
     }
   }
 }
 
-template <int HEAD_SIZE, int BLOCK_SIZE, int CTA_H>
-void launch_gemv_paged_decode_fp16_impl(
+void launch_gemv(
     torch::Tensor& out,
     torch::Tensor& query,
     torch::Tensor& key_cache,
@@ -221,79 +161,36 @@ void launch_gemv_paged_decode_fp16_impl(
     torch::Tensor& seq_lens,
     int64_t block_size,
     int64_t num_pages) {
+
   const int64_t num_seqs = query.size(0);
   const int64_t num_heads = query.size(1);
-  const int64_t max_num_blocks_per_seq = block_tables.size(1);
-  const int64_t num_queries_per_kv = num_heads / num_kv_heads;
-  const int64_t q_groups_per_kv = ceil_div(num_queries_per_kv, static_cast<int64_t>(CTA_H));
+  const int64_t max_blocks_per_seq = block_tables.size(1);
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(query));
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
-  dim3 grid(num_kv_heads * q_groups_per_kv, num_seqs, 1);
-  dim3 block(CTA_H * 32);
+  dim3 grid(num_heads, num_seqs, 1);
+  dim3 block(32, 1, 1);  // 1 warp
 
-  const size_t smem_size =
-      sizeof(half) * (CTA_H * HEAD_SIZE + 2 * BLOCK_SIZE * HEAD_SIZE)
-      + sizeof(float) * (CTA_H * BLOCK_SIZE + 3 * CTA_H);
-
-  gemv_paged_decode_kernel_fp16<HEAD_SIZE, BLOCK_SIZE, CTA_H>
-      <<<grid, block, smem_size, stream>>>(
-          reinterpret_cast<half*>(out.data_ptr()),
-          reinterpret_cast<const half*>(query.data_ptr()),
-          reinterpret_cast<const half*>(key_cache.data_ptr()),
-          reinterpret_cast<const half*>(value_cache.data_ptr()),
-          num_heads,
-          num_kv_heads,
-          num_queries_per_kv,
-          q_groups_per_kv,
-          static_cast<float>(scale),
-          block_tables.data_ptr<int>(),
-          seq_lens.data_ptr<int>(),
-          max_num_blocks_per_seq,
-          block_size,
-          num_pages,
-          query.stride(0),
-          query.stride(1),
-          out.stride(0),
-          out.stride(1),
-          key_cache.stride(0),
-          key_cache.stride(1),
-          key_cache.stride(2),
-          key_cache.stride(3),
-          value_cache.stride(0),
-          value_cache.stride(1),
-          value_cache.stride(2),
-          value_cache.stride(3));
-}
-
-template <int HEAD_SIZE, int BLOCK_SIZE>
-void launch_gemv_paged_decode_fp16(
-    torch::Tensor& out,
-    torch::Tensor& query,
-    torch::Tensor& key_cache,
-    torch::Tensor& value_cache,
-    int64_t num_kv_heads,
-    double scale,
-    torch::Tensor& block_tables,
-    torch::Tensor& seq_lens,
-    int64_t block_size,
-    int64_t num_pages) {
-  const int64_t num_heads = query.size(1);
-  const int64_t num_queries_per_kv = num_heads / num_kv_heads;
-  if (num_queries_per_kv >= 4) {
-    launch_gemv_paged_decode_fp16_impl<HEAD_SIZE, BLOCK_SIZE, 4>(
-        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
-        seq_lens, block_size, num_pages);
-  } else if (num_queries_per_kv >= 2) {
-    launch_gemv_paged_decode_fp16_impl<HEAD_SIZE, BLOCK_SIZE, 2>(
-        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
-        seq_lens, block_size, num_pages);
-  } else {
-    launch_gemv_paged_decode_fp16_impl<HEAD_SIZE, BLOCK_SIZE, 1>(
-        out, query, key_cache, value_cache, num_kv_heads, scale, block_tables,
-        seq_lens, block_size, num_pages);
-  }
+  gemv_decode_kernel<<<grid, block, 0, stream>>>(
+      reinterpret_cast<half*>(out.data_ptr()),
+      reinterpret_cast<const half*>(query.data_ptr()),
+      reinterpret_cast<const half*>(key_cache.data_ptr()),
+      reinterpret_cast<const half*>(value_cache.data_ptr()),
+      num_heads,
+      num_kv_heads,
+      static_cast<float>(scale),
+      block_tables.data_ptr<int>(),
+      seq_lens.data_ptr<int>(),
+      max_blocks_per_seq,
+      block_size,
+      num_pages,
+      query.stride(0), query.stride(1),
+      out.stride(0), out.stride(1),
+      key_cache.stride(0), key_cache.stride(1),
+      key_cache.stride(2), key_cache.stride(3),
+      value_cache.stride(0), value_cache.stride(1),
+      value_cache.stride(2), value_cache.stride(3));
 }
 
 }  // namespace
@@ -309,49 +206,9 @@ void gemv_paged_decode_attention(
     torch::Tensor& seq_lens,
     int64_t block_size,
     int64_t num_pages) {
-  TORCH_CHECK(query.dtype() == at::kHalf,
-              "GEMV decode kernel currently supports FP16 query only");
-  TORCH_CHECK(key_cache.dtype() == at::kHalf,
-              "GEMV decode kernel currently supports FP16 KV cache only");
-  TORCH_CHECK(value_cache.dtype() == at::kHalf,
-              "GEMV decode kernel currently supports FP16 KV cache only");
-  TORCH_CHECK(query.dim() == 3, "query must be [num_seqs, num_heads, head_size]");
-  TORCH_CHECK(key_cache.dim() == 4,
-              "key_cache must be [num_blocks, block_size, num_kv_heads, head_size]");
-  TORCH_CHECK(value_cache.dim() == 4,
-              "value_cache must be [num_blocks, block_size, num_kv_heads, head_size]");
-  TORCH_CHECK(block_size == key_cache.size(1), "block_size mismatch for key_cache");
-  TORCH_CHECK(block_size == value_cache.size(1), "block_size mismatch for value_cache");
-  TORCH_CHECK(num_kv_heads > 0, "num_kv_heads must be positive");
-  TORCH_CHECK(query.size(1) % num_kv_heads == 0,
-              "num_heads must be divisible by num_kv_heads");
-
-  const int64_t head_size = query.size(2);
-  switch (block_size) {
-    case 16:
-      switch (head_size) {
-        case 64:
-          launch_gemv_paged_decode_fp16<64, 16>(
-              out, query, key_cache, value_cache, num_kv_heads, scale,
-              block_tables, seq_lens, block_size, num_pages);
-          return;
-        case 128:
-          launch_gemv_paged_decode_fp16<128, 16>(
-              out, query, key_cache, value_cache, num_kv_heads, scale,
-              block_tables, seq_lens, block_size, num_pages);
-          return;
-        case 256:
-          launch_gemv_paged_decode_fp16<256, 16>(
-              out, query, key_cache, value_cache, num_kv_heads, scale,
-              block_tables, seq_lens, block_size, num_pages);
-          return;
-      }
-      break;
-  }
-
-  TORCH_CHECK(false,
-              "Unsupported GEMV decode configuration: head_size=", head_size,
-              ", block_size=", block_size);
+  launch_gemv(out, query, key_cache, value_cache,
+              num_kv_heads, scale, block_tables, seq_lens,
+              block_size, num_pages);
 }
 
 }  // namespace vllm
