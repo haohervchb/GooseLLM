@@ -21,22 +21,18 @@ __global__ void gemv_decode_kernel(
     int64_t max_blocks_per_seq,
     int64_t block_size,
     int64_t num_pages,
-    int64_t q_stride_0,
-    int64_t q_stride_1,
-    int64_t out_stride_0,
-    int64_t out_stride_1,
-    int64_t k_stride_0,
-    int64_t k_stride_1,
-    int64_t k_stride_2,
-    int64_t k_stride_3,
-    int64_t v_stride_0,
-    int64_t v_stride_1,
-    int64_t v_stride_2,
-    int64_t v_stride_3) {
+    int64_t q_stride_0, int64_t q_stride_1,
+    int64_t out_stride_0, int64_t out_stride_1,
+    int64_t k_stride_0, int64_t k_stride_1,
+    int64_t k_stride_2, int64_t k_stride_3,
+    int64_t v_stride_0, int64_t v_stride_1,
+    int64_t v_stride_2, int64_t v_stride_3) {
 
   int head_idx = blockIdx.x;
   int seq_idx = blockIdx.y;
   int lane = threadIdx.x;
+  int token_group = lane >> 1;
+  int sub_lane = lane & 1;
 
   if (head_idx >= num_heads) return;
 
@@ -44,7 +40,6 @@ __global__ void gemv_decode_kernel(
   half* out_ptr = out + seq_idx * out_stride_0 + head_idx * out_stride_1;
 
   if (seq_len <= 0) {
-    // Zero out for empty sequences
     for (int d = lane; d < 256; d += 32) out_ptr[d] = __float2half(0.0f);
     return;
   }
@@ -52,8 +47,8 @@ __global__ void gemv_decode_kernel(
   int kv_head = head_idx / (num_heads / num_kv_heads);
   const half* q_ptr = query + seq_idx * q_stride_0 + head_idx * q_stride_1;
 
-  // Accumulators — each lane handles 8 output dims (256/32)
   float acc[8];
+#pragma unroll
   for (int i = 0; i < 8; i++) acc[i] = 0.0f;
   float m = -INFINITY;
   float l = 0.0f;
@@ -65,69 +60,78 @@ __global__ void gemv_decode_kernel(
   for (int blk = 0; blk < num_blocks; blk++) {
     int phys = bt_row[blk];
     bool valid = (phys >= 0 && phys < num_pages);
-    int token_start = blk * block_size;
-    int tokens = (block_size < seq_len - token_start) ? block_size : (seq_len - token_start);
+    int tokens = (block_size < seq_len - blk * block_size) ? block_size : (seq_len - blk * block_size);
 
-    // ── QK^T: warp-shuffle dot products ──
-    float scores[16];
-    float max_score = -INFINITY;
-
-    for (int t = 0; t < tokens; t++) {
-      // Each lane computes partial dot product
-      float dot = 0.0f;
-      if (valid) {
-        int64_t k_base = (int64_t)phys * k_stride_0 + (int64_t)kv_head * k_stride_2;
-        const half* k_ptr = key_cache + k_base + t * k_stride_1;
-        for (int d = lane; d < 256; d += 32) {
-          dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d * k_stride_3]);
-        }
-      }
-      // Warp shuffle sum
-#pragma unroll
-      for (int mask = 16; mask >= 1; mask /= 2) {
-        dot += __shfl_xor_sync(0xffffffff, dot, mask);
-      }
-      if (lane == 0) {
-        scores[t] = dot * scale;
-        if (scores[t] > max_score) max_score = scores[t];
+    // ═══ PHASE 1: QK^T — parallel across 16 tokens, 2 lanes per token ═══
+    float dot = 0.0f;
+    if (token_group < tokens && valid) {
+      int64_t k_base = (int64_t)phys * k_stride_0 + (int64_t)kv_head * k_stride_2;
+      const half* k_ptr = key_cache + k_base + token_group * k_stride_1;
+      for (int d = sub_lane; d < 256; d += 2) {
+        dot += __half2float(q_ptr[d]) * __half2float(k_ptr[d * k_stride_3]);
       }
     }
+    dot += __shfl_xor_sync(0xffffffff, dot, 1);
+    float score = (token_group < tokens) ? dot * scale : -INFINITY;
 
-    // ── Online softmax (lane 0 only) ──
-    float old_m = m;
-    float new_m = fmaxf(old_m, max_score);
-    float sf = (old_m == -INFINITY) ? 0.0f : __expf(old_m - new_m);
+    // ═══ PHASE 2: Lane 0 gathers all 16 scores ═══
+    float all_scores[16];
+#pragma unroll
+    for (int t = 0; t < 16; t++) {
+      all_scores[t] = __shfl_sync(0xffffffff, score, t * 2);
+    }
+
+    // ═══ PHASE 3: Lane 0 computes softmax + broadcasts ═══
+    float sf = 0.0f;
     float tile_sum = 0.0f;
     float probs[16];
 
     if (lane == 0) {
-      for (int t = 0; t < tokens; t++) {
-        float p = __expf(scores[t] - new_m);
-        probs[t] = p;
-        tile_sum += p;
+      float m_cur = all_scores[0];
+#pragma unroll
+      for (int t = 1; t < tokens; t++) {
+        if (all_scores[t] > m_cur) m_cur = all_scores[t];
       }
+      if (m_cur == -INFINITY) m_cur = 0.0f;
+
+      float old_m = m;
+      float new_m = fmaxf(old_m, m_cur);
+      sf = (old_m == -INFINITY) ? 0.0f : __expf(old_m - new_m);
+
+      for (int i = 0; i < 8; i++) acc[i] *= sf;
+
+      float ts = 0.0f;
+#pragma unroll
+      for (int t = 0; t < tokens; t++) {
+        float p = __expf(all_scores[t] - new_m);
+        probs[t] = p;
+        ts += p;
+      }
+      tile_sum = ts;
+      l = l * sf + ts;
+      m = new_m;
     }
 
-    // Broadcast probs and state to all lanes via shared memory trick: using sf register
-    // Lane 0 writes, other lanes read via __shfl_sync
+    // Broadcast state from lane 0 to all lanes
+    sf    = __shfl_sync(0xffffffff, sf, 0);
+    m     = __shfl_sync(0xffffffff, m, 0);
+    l     = __shfl_sync(0xffffffff, l, 0);
 #pragma unroll
     for (int t = 0; t < 16; t++) {
       probs[t] = __shfl_sync(0xffffffff, probs[t], 0);
     }
-    tile_sum = __shfl_sync(0xffffffff, tile_sum, 0);
-    new_m = __shfl_sync(0xffffffff, new_m, 0);
-    sf = __shfl_sync(0xffffffff, sf, 0);
 
-    m = new_m;
-    // Rescale accumulator
-    for (int i = 0; i < 8; i++) acc[i] *= sf;
-    l = l * sf + tile_sum;
+    // ═══ PHASE 4: All lanes rescale acc ═══
+    if (lane != 0) {
+      for (int i = 0; i < 8; i++) acc[i] *= sf;
+    }
 
-    // ── PV: weighted sum ──
-    for (int t = 0; t < tokens; t++) {
-      if (valid) {
+    // ═══ PHASE 5: PV — accumulate weighted V ═══
+    if (valid) {
+      for (int t = 0; t < tokens; t++) {
         int64_t v_base = (int64_t)phys * v_stride_0 + (int64_t)kv_head * v_stride_2;
         const half* v_ptr = value_cache + v_base + t * v_stride_1;
+#pragma unroll
         for (int i = 0; i < 8; i++) {
           int d = lane + i * 32;
           if (d < 256) {
@@ -138,9 +142,10 @@ __global__ void gemv_decode_kernel(
     }
   }
 
-  // ── Output ──
+  // ═══ OUTPUT ═══
   if (l > 0.0f) {
     float inv_l = 1.0f / (l + 1e-6f);
+#pragma unroll
     for (int i = 0; i < 8; i++) {
       int d = lane + i * 32;
       if (d < 256) {
@@ -170,7 +175,7 @@ void launch_gemv(
   const cudaStream_t stream = at::cuda::getCurrentCUDAStream();
 
   dim3 grid(num_heads, num_seqs, 1);
-  dim3 block(32, 1, 1);  // 1 warp
+  dim3 block(32, 1, 1);
 
   gemv_decode_kernel<<<grid, block, 0, stream>>>(
       reinterpret_cast<half*>(out.data_ptr()),
