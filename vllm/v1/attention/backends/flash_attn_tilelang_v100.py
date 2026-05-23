@@ -203,12 +203,20 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
         """Decode: CUDA GEMV kernel (SIMT FMA + warp shuffle, zero tensor cores)."""
         is_capturing = query.is_cuda and torch.cuda.is_current_stream_capturing()
 
-        if not is_capturing:
-            if kv_cache.numel() == 0:
-                return output.fill_(0)
-            if attn_metadata.seq_lens.max().item() == 0:
-                return output.fill_(0)
+        if is_capturing:
+            return self._gemv_cuda_op(
+                layer, query, key, value, kv_cache, attn_metadata, output)
 
+        if kv_cache.numel() == 0:
+            return output.fill_(0)
+        if attn_metadata.seq_lens.max().item() == 0:
+            return output.fill_(0)
+
+        return self._gemv_cuda_op(
+            layer, query, key, value, kv_cache, attn_metadata, output)
+
+    def _gemv_cuda_op(self, layer, query, key, value, kv_cache,
+                       attn_metadata, output):
         num_actual_tokens = attn_metadata.num_actual_tokens
         query_flat = query[:num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(1)
@@ -256,7 +264,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                 "falling back to Triton.", exc)
 
         return super().forward(layer, query, key, value, kv_cache,
-                               attn_metadata, output, output_scale, output_block_scale)
+                               attn_metadata, output, None, None)
 
     def forward(self, layer, query, key, value, kv_cache, attn_metadata,
                 output=None, output_scale=None, output_block_scale=None):
@@ -299,15 +307,9 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: CUDA GEMV kernel for hd=256 (SIMT FMA + warp shuffle),
-        # Triton fallback for hd=64,128.
-        if query.shape[-1] == 256:
-            if not _logged_decode and not is_capturing:
-                logger.info("FLASH_ATTN_TILELANG_V100 CUDA GEMV decode path active (hd=256).")
-                _logged_decode = True
-            return self._tilelang_gemv_decode(
-                layer, query, key, value, kv_cache, attn_metadata, output)
-
+        # Decode: Triton (Triton is the current best option for decode;
+        # CUDA GEMV kernel exists in csrc/attention/gemv_decode.cu but
+        # needs torch.library registration for CUDA graph compatibility)
         return super().forward(layer, query, key, value, kv_cache,
                                attn_metadata, output, output_scale, output_block_scale)
 
