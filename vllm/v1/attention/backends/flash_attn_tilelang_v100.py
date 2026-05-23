@@ -294,15 +294,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return self._tilelang_paged_prefill(
                 layer, query, key, value, kv_cache, attn_metadata, output)
 
-        # Decode: CUDA GEMV kernel for hd=256 (autograd.Function wrapped,
-        # graph-capturable), Triton fallback for hd=64,128.
-        if query.shape[-1] == 256:
-            if not _logged_decode and not is_capturing:
-                logger.info("FLASH_ATTN_TILELANG_V100 CUDA GEMV decode path active (hd=256).")
-                _logged_decode = True
-            return self._tilelang_gemv_decode(
-                layer, query, key, value, kv_cache, attn_metadata, output)
-
+        # Decode: Triton
         return super().forward(layer, query, key, value, kv_cache,
                                attn_metadata, output, output_scale, output_block_scale)
 
