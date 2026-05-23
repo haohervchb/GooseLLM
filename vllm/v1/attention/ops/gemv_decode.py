@@ -62,13 +62,15 @@ class GemvDecodeOp(torch.autograd.Function):
     """Autograd wrapper — makes pybind11 kernel graph-capturable."""
 
     @staticmethod
-    def forward(ctx, output, query, key_cache, value_cache, num_kv_heads,
-                scale, block_tables, seq_lens, block_size, num_pages):
+    def forward(ctx, output, query, key_cache, value_cache,
+                num_kv_heads_t, scale_t, block_tables, seq_lens,
+                block_size_t, num_pages_t):
         ext = _load_standalone_ext()
         ext.gemv_paged_decode_attention(
             output, query, key_cache, value_cache,
-            num_kv_heads, scale, block_tables, seq_lens,
-            block_size, num_pages,
+            int(num_kv_heads_t.item()), float(scale_t.item()),
+            block_tables, seq_lens,
+            int(block_size_t.item()), int(num_pages_t.item()),
         )
         return output
 
@@ -91,6 +93,9 @@ def gemv_paged_decode_attention(
 ) -> None:
     GemvDecodeOp.apply(
         output, query, key_cache, value_cache,
-        num_kv_heads, scale, block_tables, seq_lens,
-        block_size, num_pages,
+        torch.tensor(num_kv_heads, device=output.device),
+        torch.tensor(scale, device=output.device),
+        block_tables, seq_lens,
+        torch.tensor(block_size, device=output.device),
+        torch.tensor(num_pages, device=output.device),
     )

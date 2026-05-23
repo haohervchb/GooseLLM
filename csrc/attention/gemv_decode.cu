@@ -90,7 +90,9 @@ __global__ void gemv_paged_decode_kernel_fp16(
     acc[i] = 0.0f;
   }
 
-  const int num_seq_blocks = static_cast<int>(ceil_div(seq_len, static_cast<int>(block_size)));
+  const int raw_num_seq_blocks = static_cast<int>(ceil_div(seq_len, static_cast<int>(block_size)));
+  const int num_seq_blocks = min(raw_num_seq_blocks, static_cast<int>(max_num_blocks_per_seq));
+  if (num_seq_blocks <= 0) return;
   const int* block_table = block_tables + seq_idx * max_num_blocks_per_seq;
 
   for (int logical_block_idx = 0; logical_block_idx < num_seq_blocks; ++logical_block_idx) {
