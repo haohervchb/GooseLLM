@@ -200,29 +200,16 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
 
     def _tilelang_gemv_decode(self, layer, query, key, value, kv_cache,
                                attn_metadata, output):
-        """Decode: CUDA GEMV kernel (32-thread warp-shuffle, zero syncthreads)."""
+        """Decode: CUDA GEMV kernel (internal 528→16 sub-tiling, no Python copy)."""
 
         num_actual_tokens = attn_metadata.num_actual_tokens
         query_flat = query[:num_actual_tokens]
         key_cache, value_cache = kv_cache.unbind(1)
-        k_cache = key_cache if key_cache.is_contiguous() else key_cache.contiguous()
-        v_cache = value_cache if value_cache.is_contiguous() else value_cache.contiguous()
 
-        actual_block_size = k_cache.shape[1]
-        block_size = 16
-        block_table = attn_metadata.block_table
-        if actual_block_size != block_size:
-            factor = actual_block_size // block_size
-            k_cache = k_cache.reshape(-1, block_size, k_cache.shape[2],
-                                      k_cache.shape[3])
-            v_cache = v_cache.reshape(-1, block_size, v_cache.shape[2],
-                                      v_cache.shape[3])
-            B, M = block_table.shape
-            arange = torch.arange(factor, device=block_table.device,
-                                  dtype=block_table.dtype)
-            block_table = (
-                block_table.unsqueeze(-1) * factor + arange
-            ).reshape(B, M * factor)
+        # Pass original KV cache directly — kernel handles sub-tiling internally.
+        # No reshape, no contiguous copy, no block_table expansion.
+        k_cache = key_cache
+        v_cache = value_cache
 
         try:
             from vllm.v1.attention.ops.gemv_decode import gemv_paged_decode_attention
@@ -233,7 +220,7 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
                 value_cache=v_cache,
                 num_kv_heads=key.shape[1],
                 scale=self.scale,
-                block_tables=block_table,
+                block_tables=attn_metadata.block_table,
                 seq_lens=attn_metadata.seq_lens,
                 block_size=k_cache.shape[1],
                 num_pages=k_cache.shape[0],

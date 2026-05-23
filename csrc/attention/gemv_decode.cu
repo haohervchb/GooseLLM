@@ -14,16 +14,17 @@ __global__ void gemv_decode_kernel(
     const half* __restrict__ key_cache, const half* __restrict__ value_cache,
     int64_t num_heads, int64_t num_kv_heads, float scale,
     const int* __restrict__ block_tables, const int* __restrict__ seq_lens,
-    int64_t max_blocks_per_seq, int64_t block_size, int64_t num_pages,
+    int64_t max_blocks_per_seq, int64_t page_block_size, int64_t num_pages,
     int64_t q_stride_0, int64_t q_stride_1, int64_t out_stride_0,
     int64_t out_stride_1, int64_t k_stride_0, int64_t k_stride_1,
     int64_t k_stride_2, int64_t k_stride_3, int64_t v_stride_0,
     int64_t v_stride_1, int64_t v_stride_2, int64_t v_stride_3) {
   static_assert(CTA_H >= 1 && CTA_H <= 4);
+  constexpr int TILE_SIZE = 16;
 
   int cta_idx = blockIdx.x, seq_idx = blockIdx.y;
   int warp_id = threadIdx.x / 32, lane = threadIdx.x % 32;
-  int token_group = lane >> 1, sub_lane = lane & 1;
+  int token_grp = lane >> 1, sub_lane = lane & 1;
   int q_per_kv = num_heads / num_kv_heads;
   int q_groups  = (q_per_kv + CTA_H - 1) / CTA_H;
   int kv_head   = cta_idx / q_groups;
@@ -39,37 +40,40 @@ __global__ void gemv_decode_kernel(
     return;
   }
 
+  // Sub-tile factor: how many 16-token tiles per physical 528-token page
+  int sub_tiles_per_page = page_block_size / TILE_SIZE; // 528/16 = 33
   const half* q_ptr = query + seq_idx * q_stride_0 + head_idx * q_stride_1;
   float acc[8]; for (int i = 0; i < 8; i++) acc[i] = 0.0f;
   float m = -INFINITY, l = 0.0f;
   const int* bt_row = block_tables + seq_idx * max_blocks_per_seq;
-  int nb = (seq_len + block_size - 1) / block_size;
-  if (nb > max_blocks_per_seq) nb = max_blocks_per_seq;
+  int total_tiles = (seq_len + TILE_SIZE - 1) / TILE_SIZE;
 
-  for (int blk = 0; blk < nb; blk++) {
-    int phys = bt_row[blk];
-    bool page_ok = (phys >= 0 && phys < num_pages);
-    int tok = block_size;
-    int rem = seq_len - blk * block_size;
+  for (int tile = 0; tile < total_tiles; tile++) {
+    // Map logical 16-token tile → physical 528-token page + intra-page offset
+    int page_idx  = tile / sub_tiles_per_page;
+    int intra_off = (tile % sub_tiles_per_page) * TILE_SIZE;
+    int phys      = bt_row[page_idx];
+    bool page_ok  = (phys >= 0 && phys < num_pages);
+    int tok       = TILE_SIZE;
+    int rem       = seq_len - tile * TILE_SIZE;
     if (tok > rem) tok = rem;
 
-    // QK^T: parallel across 16 tokens, 2 lanes per token, load K from global
+    // QK^T: parallel across 16 tokens, 2 lanes per token
     float dot = 0.0f;
-    if (token_group < tok && page_ok) {
+    if (token_grp < tok && page_ok) {
       int64_t kb = (int64_t)phys * k_stride_0 + (int64_t)kv_head * k_stride_2;
-      const half* kp = key_cache + kb + token_group * k_stride_1;
+      const half* kp = key_cache + kb + (intra_off + token_grp) * k_stride_1;
       for (int d = sub_lane; d < 256; d += 2)
         dot += __half2float(q_ptr[d]) * __half2float(kp[d * k_stride_3]);
     }
     dot += __shfl_xor_sync(0xffffffff, dot, 1);
-    float score = (token_group < tok) ? dot * scale : -INFINITY;
+    float score = (token_grp < tok) ? dot * scale : -INFINITY;
 
     float all_scores[16];
 #pragma unroll
     for (int t = 0; t < 16; t++)
       all_scores[t] = __shfl_sync(0xffffffff, score, t * 2);
 
-    // Softmax on lane 0, broadcast
     float sf = 0.0f, probs[16];
     if (lane == 0) {
       float mc = all_scores[0];
@@ -96,11 +100,11 @@ __global__ void gemv_decode_kernel(
     if (lane != 0)
       for (int i = 0; i < 8; i++) acc[i] *= sf;
 
-    // PV: accumulate weighted V (load V from global per lane)
+    // PV
     if (page_ok) {
       for (int t = 0; t < tok; t++) {
         int64_t vb = (int64_t)phys * v_stride_0 + (int64_t)kv_head * v_stride_2;
-        const half* vp = value_cache + vb + t * v_stride_1;
+        const half* vp = value_cache + vb + (intra_off + t) * v_stride_1;
 #pragma unroll
         for (int i = 0; i < 8; i++) {
           int d = lane + i * 32;
@@ -129,7 +133,7 @@ void launch_gemv(torch::Tensor& out, torch::Tensor& query, torch::Tensor& key_ca
   const at::cuda::OptionalCUDAGuard g(device_of(query));
 
   dim3 grid(nkv * ((qpk + 3) / 4), ns, 1);
-  dim3 block(128, 1, 1);  // 4 warps
+  dim3 block(128, 1, 1);
 
   gemv_decode_kernel<4><<<grid, block, 0, at::cuda::getCurrentCUDAStream()>>>(
       reinterpret_cast<half*>(out.data_ptr()), reinterpret_cast<const half*>(query.data_ptr()),
