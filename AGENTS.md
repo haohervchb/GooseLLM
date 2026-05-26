@@ -53,6 +53,7 @@ Kernels are JIT-compiled via TileLang. Config per head_dim:
 | 64  | 32      | 128     | 256     |       |
 | 128 | 32      | 128     | 256     |       |
 | 256 | 64      | 32      | 256     | 1.3-1.5x faster than M32 N64 |
+| 512 | 16      | 32      | 64      | Gemma4 full_attention; 2 warps due to V100 shared mem |
 
 ## Branch Policy
 
@@ -72,6 +73,7 @@ Kernels are JIT-compiled via TileLang. Config per head_dim:
 | `VLLM_USE_SM70_DECODE=0` | Disable SM70 decode kernel (default: enabled) |
 | `VLLM_DEBUG_CHECK_NAN=1` | Enable NaN/Inf checks in model runner hot path (default: off) |
 | `--disable-custom-all-reduce` | Disable custom AR (not recommended) |
+| `CUDA_HOME` | Required for TileLang kernel compilation; use CUDA 12.8+ for HD 512 support |
 
 ## Known Limitations
 
