@@ -12,6 +12,7 @@ def test_gemma4_load_tp2():
         tensor_parallel_size=2,
         enforce_eager=True,
         max_model_len=2048,
+        limit_mm_per_prompt={"image": 1},  # Multimodal model
     )
     
     outputs = llm.generate("Hello", max_tokens=5)
@@ -30,6 +31,7 @@ def test_gemma4_load_tp4():
         tensor_parallel_size=4,
         enforce_eager=True,
         max_model_len=2048,
+        limit_mm_per_prompt={"image": 1},  # Multimodal model
     )
     
     outputs = llm.generate("Hello", max_tokens=5)
