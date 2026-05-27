@@ -563,20 +563,21 @@ if is_causal:
 
 ## Progress
 
-### ✅ Completed: HD 512 Kernel (2026-05-26)
+### ✅ Completed: Gemma4-31B End-to-End (2026-05-27)
 
-- **TileLang FA-V100 HD 512 paged kernel**: COMPILED AND VERIFIED
-- **Dense FA HD 512**: Auto-tuned to `block_M=16, block_N=32, threads=64` ✓
-- **TP2/TP4 simulation**: All head counts pass ✓
-- **Key finding**: Requires CUDA 12.8 ptxas (CUDA 12.0 ptxas segfaults on large kernels)
+- **Model loading**: Loads with TP=4 on 4× V100-32GB, ~15.5 GiB per GPU ✓
+- **TileLang FA-V100 backend**: Active for paged prefill attention ✓
+- **Sliding window**: HD 256 and HD 512 sliding window support ✓
+- **CUDA graphs**: Captured for decode (piecewise + full) ✓
+- **Concurrent requests**: Working correctly ✓
+- **Chat template**: Uses `examples/tool_chat_template_gemma4.jinja` ✓
 
-### ✅ Validated Configurations
+### ✅ HD 512 Kernel Config
 
-| Head Dim | block_M | block_N | threads | Shared Mem | Status |
-|----------|---------|---------|---------|------------|--------|
-| 256 | 64 | 32 | 256 | ~66KB | ✅ Proven |
-| 512 | 16 | 32 | 64 | ~81KB | ✅ New |
-| 512 (dense) | 16 | 32 | 64 | N/A | ✅ Auto-tuned |
+| Head Dim | block_M | block_N | threads | Shared Mem | Notes |
+|----------|---------|---------|---------|------------|-------|
+| 256 | 64 | 32 | 256 | ~66KB | Sliding attention layers |
+| 512 | 32 | 32 | 128 | ~66KB | Full attention layers (KV-union) |
 
 ### ⬜ Remaining Work
 
