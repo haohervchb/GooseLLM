@@ -89,8 +89,6 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             return False
         if self.sinks is not None:
             return False
-        if self.sliding_window != (-1, -1):
-            return False
         if self.kv_cache_dtype.startswith("fp8"):
             return False
         self._tilelang_paged_ready = True
@@ -147,6 +145,8 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             out=out_view, block_size=block_size,
             softmax_scale=self.scale, causal=causal,
             num_kv_heads=key.shape[1],
+            sliding_window_q=self.sliding_window[0] if self.sliding_window[0] > 0 else -1,
+            sliding_window_k=self.sliding_window[1] if self.sliding_window[1] > 0 else -1,
         )
 
         if not (query.is_cuda and torch.cuda.is_current_stream_capturing()):
@@ -249,7 +249,6 @@ class FlashAttnTileLangV100Impl(TritonAttentionImpl):
             and self.alibi_slopes is None
             and self.logits_soft_cap == 0
             and self.sinks is None
-            and self.sliding_window == (-1, -1)
             and not self.kv_cache_dtype.startswith("fp8")
         )
 

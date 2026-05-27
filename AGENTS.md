@@ -14,6 +14,9 @@ cd csrc/flash_attention_v100
 python setup.py build_ext --inplace
 ```
 
+**Note:** Requires `CUDA_HOME` pointing to CUDA 12.8+ (CUDA 12.0 `ptxas` segfaults on large SM70 kernels).
+Auto-set via conda env activation in the `goosellm` environment.
+
 ## Kernel Code Location
 
 - **Production kernels**: `csrc/flash_attention_v100/kernel/`
@@ -53,6 +56,7 @@ Kernels are JIT-compiled via TileLang. Config per head_dim:
 | 64  | 32      | 128     | 256     |       |
 | 128 | 32      | 128     | 256     |       |
 | 256 | 64      | 32      | 256     | 1.3-1.5x faster than M32 N64 |
+| 512 | 32      | 32      | 128     | Gemma4 full_attention; 4 warps with KV-union optimization |
 
 ## Branch Policy
 
@@ -72,8 +76,42 @@ Kernels are JIT-compiled via TileLang. Config per head_dim:
 | `VLLM_USE_SM70_DECODE=0` | Disable SM70 decode kernel (default: enabled) |
 | `VLLM_DEBUG_CHECK_NAN=1` | Enable NaN/Inf checks in model runner hot path (default: off) |
 | `--disable-custom-all-reduce` | Disable custom AR (not recommended) |
+| `CUDA_HOME` | Required for TileLang kernel compilation; use CUDA 12.8+ for HD 512 support. CUDA 12.0 `ptxas` segfaults on large SM70 kernels. Auto-set via conda env activation in the `goosellm` environment. |
 
 ## Known Limitations
 
 - **Spark/m8n8k4 paths**: Disabled by default (performance-negative).
 - **GQA-shared-KV grid**: Implemented but disabled (performance-negative).
+- **Gemma4-31B (FP16)**: Supported (text-only, TP4 on 4× V100-32GB). TileLang FA-V100 backend active for prefill, Triton for decode. Concurrent requests work.
+- **Gemma4-31B (quantized)**: AWQ/FP8 variants not yet tested.
+
+## Serving Gemma4-31B
+
+```bash
+NCCL_P2P_LEVEL=NVL VLLM_CUSTOM_ALLREDUCE_ALGO=2stage FLA_USE_TILELANG=1 \
+CUDA_VISIBLE_DEVICES=0,1,2,3 python -m vllm.entrypoints.openai.api_server \
+    --model google/gemma-4-31B \
+    --tensor-parallel-size 4 \
+    --dtype float16 \
+    --gpu-memory-utilization 0.80 \
+    --max-model-len 262144 \
+    --max-num-seqs 4 \
+    --max-num-batched-tokens 16384 \
+    --attention-backend FLASH_ATTN_TILELANG_V100 \
+    --compilation-config '{"cudagraph_mode":"full_and_piecewise"}' \
+    --chat-template examples/tool_chat_template_gemma4.jinja \
+    --host 0.0.0.0 \
+    --port 8082 \
+    --limit-mm-per-prompt '{"image": 0, "audio": 0, "video": 0}'
+```
+
+### Flag Explanation
+
+| Flag | Purpose |
+|------|---------|
+| `--attention-backend FLASH_ATTN_TILELANG_V100` | TileLang FlashAttention on V100 (paged prefill) |
+| `--limit-mm-per-prompt '{"image":0,"audio":0,"video":0}'` | Text-only mode; skips vision/audio encoder loading |
+| `--chat-template examples/tool_chat_template_gemma4.jinja` | Required - tokenizer has no default chat template |
+| `--tensor-parallel-size 4` | Shards model across all 4 GPUs |
+| `--compilation-config '{"cudagraph_mode":"full_and_piecewise"}'` | CUDA graph capture for decode |
+| `--max-model-len 262144` | Full 256K context (adjust down for memory savings) |
