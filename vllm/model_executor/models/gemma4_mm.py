@@ -1384,8 +1384,6 @@ class Gemma4ForConditionalGeneration(
                 if layer_idx in self._full_attn_layer_idxs:
                     if hasattr(metadata, "mm_prefix_range"):
                         metadata.mm_prefix_range = None
-                    if hasattr(metadata, "mm_prefix_range_tensor"):
-                        metadata.mm_prefix_range_tensor = None
 
         if isinstance(attn_metadata, list):
             for ub_metadata in attn_metadata:
