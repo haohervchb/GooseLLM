@@ -63,6 +63,8 @@ cd 3rdparty/tvm
 git apply "$GPP/patches/tilelang-tvm-padded-layout.patch"
 cd ../..
 pip install -e .
+# Pin apache-tvm-ffi — 0.1.12+ breaks on TVM's DictAttrs.__dict__ field (Python won't setattr on dunder dunder dunder)
+pip install "apache-tvm-ffi>=0.1.2,<0.1.12"
 cd "$GPP"
 
 # 5. Install TileLang FA-V100 kernels (pure Python, depends on tilelang)

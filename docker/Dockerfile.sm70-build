@@ -71,6 +71,9 @@ RUN cd /opt/tilelang \
 
 RUN cd /opt/tilelang && python3 -m pip install -e . --break-system-packages
 
+# Pin apache-tvm-ffi — 0.1.12+ crashes on TVM's DictAttrs.__dict__ field
+RUN python3 -m pip install "apache-tvm-ffi>=0.1.2,<0.1.12" --break-system-packages
+
 WORKDIR /build
 
 COPY . /build/
