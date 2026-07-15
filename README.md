@@ -7,6 +7,7 @@ This fork adds:
 - **TileLang JIT-compiled FlashAttention** — paged prefill kernel covering all attention layers (dense and MoE models). Compiled once per head dim during first request, no offline build step.
 - **TileLang-accelerated Gated DeltaNet / Flash Linear Attention** — SM70 kernel paths for hybrid MoE layers (`FLA_USE_TILELANG=1`).
 - **Hybrid model support** — automatically handles Qwen3.5-122B-A10B style mixed attention + GatedDeltaNet architectures (1056-token alignment pages split into 16-token sub-pages).
+- **Automatic prefix caching** — safely reuses warm KV-cache prefixes without clearing shared cached blocks, including hybrid Qwen3.5 models.
 - **Expert parallelism** — `--enable-expert-parallel` for MoE models, works with both AWQ and FP16.
 - **FP16 inference** — supports Qwen3.6-35B-A3B and Qwen3.6-27B in FP16 mode (no quantization required).
 
@@ -91,6 +92,10 @@ Before running any of the commands below, make sure you're in the conda environm
 conda activate goosellm
 ```
 
+The examples enable automatic prefix caching explicitly. Warm repeated-prefix
+generation and tool calls have been validated on Qwen3.5-122B-A10B-AWQ with
+4× V100-32GB. Use `--no-enable-prefix-caching` only when caching is not wanted.
+
 ### MoE Model (Qwen3.6-35B-A3B-AWQ / Qwen3.5-122B-A10B-AWQ)
 
 ```bash
@@ -103,6 +108,7 @@ python -m vllm.entrypoints.openai.api_server \
   --max-model-len 262144 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 16384 \
+  --enable-prefix-caching \
   --trust-remote-code \
   --attention-backend FLASH_ATTN_TILELANG_V100 \
   --enable-expert-parallel \
@@ -125,6 +131,7 @@ python -m vllm.entrypoints.openai.api_server \
   --max-model-len 262144 \
   --max-num-seqs 1 \
   --max-num-batched-tokens 16384 \
+  --enable-prefix-caching \
   --trust-remote-code \
   --attention-backend FLASH_ATTN_TILELANG_V100 \
   --skip-mm-profiling \
@@ -154,6 +161,7 @@ docker run --rm \
     --tensor-parallel-size 4 \
     --max-num-seqs 1 \
     --max-num-batched-tokens 16384 \
+    --enable-prefix-caching \
     --trust-remote-code \
     --attention-backend FLASH_ATTN_TILELANG_V100 \
     --enable-expert-parallel \
@@ -182,6 +190,7 @@ docker run --rm \
     --tensor-parallel-size 4 \
     --max-num-seqs 1 \
     --max-num-batched-tokens 16384 \
+    --enable-prefix-caching \
     --trust-remote-code \
     --attention-backend FLASH_ATTN_TILELANG_V100 \
     --skip-mm-profiling \
