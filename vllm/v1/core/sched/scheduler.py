@@ -329,7 +329,13 @@ class Scheduler(SchedulerInterface):
         scheduled_running_reqs: list[Request] = []
         preempted_reqs: list[Request] = []
 
+        # `req_to_new_blocks` is scheduler metadata for updating worker block
+        # tables. For newly admitted requests it contains the request's full
+        # block table, including prefix-cache hits. Keep the blocks that were
+        # actually allocated in this step separately so cached KV is never
+        # mistaken for fresh storage and zeroed by the model runner.
         req_to_new_blocks: dict[str, KVCacheBlocks] = {}
+        req_to_fresh_blocks: dict[str, KVCacheBlocks] = {}
         num_scheduled_tokens: dict[str, int] = {}
         token_budget = self.max_num_scheduled_tokens
         # Encoder-related.
@@ -444,6 +450,7 @@ class Scheduler(SchedulerInterface):
                             scheduled_running_reqs.remove(preempted_req)
                             token_budget += num_scheduled_tokens.pop(preempted_req_id)
                             req_to_new_blocks.pop(preempted_req_id)
+                            req_to_fresh_blocks.pop(preempted_req_id)
                             scheduled_spec_decode_tokens.pop(preempted_req_id, None)
                             preempted_encoder_inputs = scheduled_encoder_inputs.pop(
                                 preempted_req_id, None
@@ -474,6 +481,7 @@ class Scheduler(SchedulerInterface):
             scheduled_running_reqs.append(request)
             request_id = request.request_id
             req_to_new_blocks[request_id] = new_blocks
+            req_to_fresh_blocks[request_id] = new_blocks
             num_scheduled_tokens[request_id] = num_new_tokens
             token_budget -= num_new_tokens
             req_index += 1
@@ -755,6 +763,7 @@ class Scheduler(SchedulerInterface):
 
                 if self.lora_config and request.lora_request:
                     scheduled_loras.add(request.lora_request.lora_int_id)
+                req_to_fresh_blocks[request_id] = new_blocks
                 req_to_new_blocks[request_id] = self.kv_cache_manager.get_blocks(
                     request_id
                 )
@@ -841,7 +850,7 @@ class Scheduler(SchedulerInterface):
         new_block_ids_to_zero = sorted(
             {
                 block_id
-                for blocks in req_to_new_blocks.values()
+                for blocks in req_to_fresh_blocks.values()
                 for kv_group_blocks in blocks.get_block_ids()
                 for block_id in kv_group_blocks
             }

@@ -105,6 +105,44 @@ def test_schedule(enable_prefix_caching: bool, prompt_logprobs: int | None):
         assert scheduler.running[i] == request
 
 
+def test_prefix_cache_hit_blocks_are_not_zeroed():
+    """Only blocks allocated this step may be cleared by the GPU runner."""
+    scheduler = create_scheduler(enable_prefix_caching=True, block_size=16)
+    (first_request,) = create_requests(
+        num_requests=1,
+        num_tokens=33,
+        max_tokens=1,
+        same_prompt=True,
+        req_ids=["first"],
+    )
+    scheduler.add_request(first_request)
+
+    first_output = scheduler.schedule()
+    first_blocks = scheduler.kv_cache_manager.get_blocks(
+        first_request.request_id
+    ).get_block_ids()[0]
+    cached_prefix_blocks = set(first_blocks[:2])
+    assert cached_prefix_blocks <= set(first_output.new_block_ids_to_zero or [])
+
+    # Finish the cold request, leaving its two complete prompt blocks in the
+    # prefix cache with no live request holding them.
+    scheduler.update_from_output(first_output, make_output(scheduler))
+    assert not scheduler.running
+
+    (warm_request,) = create_requests(
+        num_requests=1,
+        num_tokens=33,
+        max_tokens=1,
+        same_prompt=True,
+        req_ids=["warm"],
+    )
+    scheduler.add_request(warm_request)
+    warm_output = scheduler.schedule()
+
+    assert warm_request.num_cached_tokens == 32
+    assert cached_prefix_blocks.isdisjoint(warm_output.new_block_ids_to_zero or [])
+
+
 def test_schedule_multimodal_requests():
     scheduler = create_scheduler(model="llava-hf/llava-1.5-7b-hf")
     mm_positions = [[PlaceholderRange(offset=i, length=100)] for i in range(10)]
